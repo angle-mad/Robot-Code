@@ -1,9 +1,57 @@
+import os
+
 import cv2
 import numpy as np
 
 
-# Use your webcam
-camera = cv2.VideoCapture(0)
+FRAME_WIDTH = 640
+FRAME_HEIGHT = 480
+CAMERA_BACKEND = os.environ.get("CAMERA_BACKEND", "auto").lower()
+
+
+class Picamera2Camera:
+    def __init__(self, width, height):
+        from picamera2 import Picamera2
+
+        self.camera = Picamera2()
+        config = self.camera.create_preview_configuration(
+            main={
+                "size": (width, height),
+                "format": "RGB888"
+            }
+        )
+        self.camera.configure(config)
+        self.camera.start()
+
+    def read(self):
+        frame = self.camera.capture_array()
+        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        return True, frame
+
+    def release(self):
+        self.camera.stop()
+
+
+def open_camera(width, height):
+    if CAMERA_BACKEND in ("auto", "picamera2"):
+        try:
+            print("Opening camera with Picamera2/libcamera.")
+            return Picamera2Camera(width, height)
+        except Exception as error:
+            if CAMERA_BACKEND == "picamera2":
+                raise
+
+            print("Picamera2 camera unavailable:", error)
+            print("Falling back to OpenCV VideoCapture.")
+
+    camera = cv2.VideoCapture(0)
+    camera.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    camera.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+
+    return camera
+
+
+camera = open_camera(FRAME_WIDTH, FRAME_HEIGHT)
 window_name = "Tennis Ball Detector"
 last_hsv_sample = None
 last_click = None
@@ -19,10 +67,6 @@ roi_mode = False
 roi_start = None
 roi_end = None
 roi_box = None
-
-camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-
 
 def make_range_from_hsv(hsv_value):
     hue_range = 5
