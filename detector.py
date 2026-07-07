@@ -906,6 +906,27 @@ colors = [
         ],
         "box_color": (224, 184, 76)
     },
+    {
+        "name": "limon",
+        "lower": np.array([39, 0, 204]),
+        "upper": np.array([84, 120, 255]),
+        "sample_ranges": [
+            {
+                "lower": np.array([75, 0, 198]),
+                "upper": np.array([85, 50, 255]),
+            },
+            {
+                "lower": np.array([48, 0, 207]),
+                "upper": np.array([58, 60, 255]),
+            },
+            {
+                "lower": np.array([38, 55, 189]),
+                "upper": np.array([48, 135, 255]),
+            },
+        ],
+        "box_color": (200, 238, 202),
+        "min_detection_saturation": 45
+    },
 ]
 
 
