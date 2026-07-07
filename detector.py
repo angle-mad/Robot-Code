@@ -1,4 +1,6 @@
 import os
+import platform
+import traceback
 
 import cv2
 import numpy as np
@@ -7,6 +9,29 @@ import numpy as np
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
 CAMERA_BACKEND = os.environ.get("CAMERA_BACKEND", "auto").lower()
+VALID_CAMERA_BACKENDS = ("auto", "picamera2", "opencv")
+
+
+def list_video_devices():
+    try:
+        return sorted(
+            device
+            for device in os.listdir("/dev")
+            if device.startswith("video")
+        )
+    except OSError as error:
+        return ["could not list /dev: " + str(error)]
+
+
+def print_camera_debug_header():
+    print("Camera debug:")
+    print("  backend request:", CAMERA_BACKEND)
+    print("  frame size:", str(FRAME_WIDTH) + "x" + str(FRAME_HEIGHT))
+    print("  python:", platform.python_version())
+    print("  platform:", platform.platform())
+    print("  opencv:", cv2.__version__)
+    print("  /dev video devices:", ", ".join(list_video_devices()) or "none")
+    print()
 
 
 class Picamera2Camera:
@@ -22,10 +47,32 @@ class Picamera2Camera:
         )
         self.camera.configure(config)
         self.camera.start()
+        self.frame_count = 0
+        print("Picamera2 started.")
+        print("  configured size:", str(width) + "x" + str(height))
+        print("  configured format: RGB888")
 
     def read(self):
-        frame = self.camera.capture_array()
-        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        try:
+            frame = self.camera.capture_array()
+        except Exception:
+            print("Picamera2 capture_array() failed:")
+            traceback.print_exc()
+            return False, None
+
+        if frame is None:
+            print("Picamera2 returned no frame.")
+            return False, None
+
+        if len(frame.shape) != 3 or frame.shape[2] < 3:
+            print("Picamera2 returned an unexpected frame shape:", frame.shape)
+            return False, None
+
+        if self.frame_count == 0:
+            print("First Picamera2 frame shape:", frame.shape)
+
+        self.frame_count += 1
+        frame = cv2.cvtColor(frame[:, :, :3], cv2.COLOR_RGB2BGR)
         return True, frame
 
     def release(self):
@@ -33,20 +80,47 @@ class Picamera2Camera:
 
 
 def open_camera(width, height):
+    if CAMERA_BACKEND not in VALID_CAMERA_BACKENDS:
+        raise ValueError(
+            "CAMERA_BACKEND must be one of: "
+            + ", ".join(VALID_CAMERA_BACKENDS)
+        )
+
+    print_camera_debug_header()
+
     if CAMERA_BACKEND in ("auto", "picamera2"):
         try:
             print("Opening camera with Picamera2/libcamera.")
             return Picamera2Camera(width, height)
-        except Exception as error:
+        except ImportError:
+            print("Picamera2 import failed:")
+            traceback.print_exc()
+            print()
+
             if CAMERA_BACKEND == "picamera2":
                 raise
 
-            print("Picamera2 camera unavailable:", error)
+            print("Falling back to OpenCV VideoCapture.")
+        except Exception:
+            print("Picamera2 startup failed:")
+            traceback.print_exc()
+            print()
+
+            if CAMERA_BACKEND == "picamera2":
+                raise
+
             print("Falling back to OpenCV VideoCapture.")
 
+    print("Opening camera with OpenCV VideoCapture(0).")
     camera = cv2.VideoCapture(0)
     camera.set(cv2.CAP_PROP_FRAME_WIDTH, width)
     camera.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+
+    print("OpenCV camera opened:", camera.isOpened())
+    print("  requested size:", str(width) + "x" + str(height))
+    print("  reported width:", camera.get(cv2.CAP_PROP_FRAME_WIDTH))
+    print("  reported height:", camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    print("  reported backend:", camera.getBackendName() if camera.isOpened() else "none")
 
     return camera
 
@@ -67,6 +141,27 @@ roi_mode = False
 roi_start = None
 roi_end = None
 roi_box = None
+
+
+def print_camera_read_failure(camera):
+    print("Could not access camera")
+    print("Camera read failure debug:")
+    print("  selected backend:", type(camera).__name__)
+
+    if hasattr(camera, "isOpened"):
+        print("  opencv isOpened:", camera.isOpened())
+        print("  opencv backend:", camera.getBackendName() if camera.isOpened() else "none")
+        print("  opencv width:", camera.get(cv2.CAP_PROP_FRAME_WIDTH))
+        print("  opencv height:", camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    print("  /dev video devices:", ", ".join(list_video_devices()) or "none")
+    print()
+    print("Try these on the Pi for more context:")
+    print("  CAMERA_BACKEND=picamera2 python3 detector.py")
+    print("  python3 -c \"from picamera2 import Picamera2; print(Picamera2.global_camera_info())\"")
+    print("  libcamera-hello --list-cameras")
+    print()
+
 
 def make_range_from_hsv(hsv_value):
     hue_range = 5
@@ -1017,7 +1112,7 @@ while True:
     ret, frame = camera.read()
 
     if not ret:
-        print("Could not access camera")
+        print_camera_read_failure(camera)
         break
 
 
