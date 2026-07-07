@@ -1,14 +1,164 @@
+import os
+import platform
+import time
+import traceback
+
 import cv2
 import numpy as np
 
 
-# Use your webcam
-camera = cv2.VideoCapture(0)
+FRAME_WIDTH = 640
+FRAME_HEIGHT = 480
+CAMERA_BACKEND = os.environ.get("CAMERA_BACKEND", "auto").lower()
+VALID_CAMERA_BACKENDS = ("auto", "picamera2", "opencv")
+HEADLESS_REQUEST = os.environ.get("HEADLESS", "auto").lower()
+VALID_HEADLESS_OPTIONS = ("auto", "true", "false")
+
+
+def running_without_display():
+    if HEADLESS_REQUEST not in VALID_HEADLESS_OPTIONS:
+        raise ValueError(
+            "HEADLESS must be one of: "
+            + ", ".join(VALID_HEADLESS_OPTIONS)
+        )
+
+    if HEADLESS_REQUEST == "true":
+        return True
+
+    if HEADLESS_REQUEST == "false":
+        return False
+
+    return os.name != "nt" and os.environ.get("DISPLAY", "") == ""
+
+
+HEADLESS = running_without_display()
+
+
+def list_video_devices():
+    try:
+        return sorted(
+            device
+            for device in os.listdir("/dev")
+            if device.startswith("video")
+        )
+    except OSError as error:
+        return ["could not list /dev: " + str(error)]
+
+
+def print_camera_debug_header():
+    print("Camera debug:")
+    print("  backend request:", CAMERA_BACKEND)
+    print("  headless:", HEADLESS)
+    print("  frame size:", str(FRAME_WIDTH) + "x" + str(FRAME_HEIGHT))
+    print("  python:", platform.python_version())
+    print("  platform:", platform.platform())
+    print("  opencv:", cv2.__version__)
+    print("  /dev video devices:", ", ".join(list_video_devices()) or "none")
+    print()
+
+
+class Picamera2Camera:
+    def __init__(self, width, height):
+        from picamera2 import Picamera2
+
+        self.camera = Picamera2()
+        config = self.camera.create_preview_configuration(
+            main={
+                "size": (width, height),
+                "format": "RGB888"
+            }
+        )
+        self.camera.configure(config)
+        self.camera.start()
+        self.frame_count = 0
+        print("Picamera2 started.")
+        print("  configured size:", str(width) + "x" + str(height))
+        print("  configured format: RGB888")
+
+    def read(self):
+        try:
+            frame = self.camera.capture_array()
+        except Exception:
+            print("Picamera2 capture_array() failed:")
+            traceback.print_exc()
+            return False, None
+
+        if frame is None:
+            print("Picamera2 returned no frame.")
+            return False, None
+
+        if len(frame.shape) != 3 or frame.shape[2] < 3:
+            print("Picamera2 returned an unexpected frame shape:", frame.shape)
+            return False, None
+
+        if self.frame_count == 0:
+            print("First Picamera2 frame shape:", frame.shape)
+
+        self.frame_count += 1
+        frame = cv2.cvtColor(frame[:, :, :3], cv2.COLOR_RGB2BGR)
+        return True, frame
+
+    def release(self):
+        self.camera.stop()
+
+
+def open_camera(width, height):
+    if CAMERA_BACKEND not in VALID_CAMERA_BACKENDS:
+        raise ValueError(
+            "CAMERA_BACKEND must be one of: "
+            + ", ".join(VALID_CAMERA_BACKENDS)
+        )
+
+    print_camera_debug_header()
+
+    if CAMERA_BACKEND in ("auto", "picamera2"):
+        try:
+            print("Opening camera with Picamera2/libcamera.")
+            return Picamera2Camera(width, height)
+        except ImportError:
+            print("Picamera2 import failed:")
+            traceback.print_exc()
+            print()
+
+            if CAMERA_BACKEND == "picamera2" or (
+                CAMERA_BACKEND == "auto" and os.name != "nt"
+            ):
+                raise
+
+            print("Falling back to OpenCV VideoCapture.")
+        except Exception:
+            print("Picamera2 startup failed:")
+            traceback.print_exc()
+            print()
+
+            if CAMERA_BACKEND == "picamera2" or (
+                CAMERA_BACKEND == "auto" and os.name != "nt"
+            ):
+                raise
+
+            print("Falling back to OpenCV VideoCapture.")
+
+    print("Opening camera with OpenCV VideoCapture(0).")
+    camera = cv2.VideoCapture(0)
+    camera.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    camera.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+
+    print("OpenCV camera opened:", camera.isOpened())
+    print("  requested size:", str(width) + "x" + str(height))
+    print("  reported width:", camera.get(cv2.CAP_PROP_FRAME_WIDTH))
+    print("  reported height:", camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    print("  reported backend:", camera.getBackendName() if camera.isOpened() else "none")
+
+    return camera
+
+
+camera = open_camera(FRAME_WIDTH, FRAME_HEIGHT)
 window_name = "Tennis Ball Detector"
 last_hsv_sample = None
 last_click = None
 last_assignment = "No color assigned yet"
 current_hsv = None
+last_detection_print_time = 0
 naming_mode = False
 typed_color_name = ""
 delete_mode = False
@@ -20,8 +170,25 @@ roi_start = None
 roi_end = None
 roi_box = None
 
-camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+def print_camera_read_failure(camera):
+    print("Could not access camera")
+    print("Camera read failure debug:")
+    print("  selected backend:", type(camera).__name__)
+
+    if hasattr(camera, "isOpened"):
+        print("  opencv isOpened:", camera.isOpened())
+        print("  opencv backend:", camera.getBackendName() if camera.isOpened() else "none")
+        print("  opencv width:", camera.get(cv2.CAP_PROP_FRAME_WIDTH))
+        print("  opencv height:", camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    print("  /dev video devices:", ", ".join(list_video_devices()) or "none")
+    print()
+    print("Try these on the Pi for more context:")
+    print("  CAMERA_BACKEND=picamera2 python3 detector.py")
+    print("  python3 -c \"from picamera2 import Picamera2; print(Picamera2.global_camera_info())\"")
+    print("  libcamera-hello --list-cameras")
+    print()
 
 
 def make_range_from_hsv(hsv_value):
@@ -563,8 +730,11 @@ def show_hsv_value(event, x, y, flags, param):
     print()
 
 
-cv2.namedWindow(window_name)
-cv2.setMouseCallback(window_name, show_hsv_value)
+if not HEADLESS:
+    cv2.namedWindow(window_name)
+    cv2.setMouseCallback(window_name, show_hsv_value)
+else:
+    print("Running headless: camera windows and mouse calibration are disabled.")
 
 
 # Starting colors from your calibration.
@@ -973,7 +1143,7 @@ while True:
     ret, frame = camera.read()
 
     if not ret:
-        print("Could not access camera")
+        print_camera_read_failure(camera)
         break
 
 
@@ -987,6 +1157,7 @@ while True:
 
 
     detected_ball_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+    current_time = time.time()
 
     for color in colors:
 
@@ -1065,12 +1236,22 @@ while True:
                     2
                 )
 
+                if HEADLESS and current_time - last_detection_print_time > 1:
+                    print(
+                        "Detected",
+                        color["name"],
+                        "at x=" + str(center_x),
+                        "y=" + str(center_y)
+                    )
+                    last_detection_print_time = current_time
 
-    draw_calibration_menu(frame)
-    draw_detection_area(frame)
+
+    if not HEADLESS:
+        draw_calibration_menu(frame)
+        draw_detection_area(frame)
 
 
-    if last_hsv_sample is not None and last_click is not None:
+    if not HEADLESS and last_hsv_sample is not None and last_click is not None:
 
         cv2.circle(
             frame,
@@ -1100,21 +1281,24 @@ while True:
         )
 
 
-    # Show camera
-    cv2.imshow(
-        window_name,
-        frame
-    )
+    if not HEADLESS:
+        # Show camera
+        cv2.imshow(
+            window_name,
+            frame
+        )
 
 
-    # Show mask
-    cv2.imshow(
-        "Detected Ball Mask",
-        detected_ball_mask
-    )
+        # Show mask
+        cv2.imshow(
+            "Detected Ball Mask",
+            detected_ball_mask
+        )
 
 
-    key = cv2.waitKey(1) & 0xFF
+        key = cv2.waitKey(1) & 0xFF
+    else:
+        key = 255
 
     if key != 255:
         handle_key(key)
@@ -1126,4 +1310,6 @@ while True:
 
 
 camera.release()
-cv2.destroyAllWindows()
+
+if not HEADLESS:
+    cv2.destroyAllWindows()
