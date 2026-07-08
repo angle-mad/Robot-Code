@@ -54,6 +54,12 @@ TARGET_CLUSTER_WEIGHT = float(os.environ.get("TARGET_CLUSTER_WEIGHT", "0.35"))
 TARGET_AREA_WEIGHT = float(os.environ.get("TARGET_AREA_WEIGHT", "0.1"))
 TARGET_CENTER_WEIGHT = float(os.environ.get("TARGET_CENTER_WEIGHT", "0.05"))
 TARGET_CLUSTER_RADIUS_RATIO = float(os.environ.get("TARGET_CLUSTER_RADIUS_RATIO", "0.22"))
+TARGET_LOCK_RADIUS_RATIO = float(os.environ.get("TARGET_LOCK_RADIUS_RATIO", "0.18"))
+TARGET_SWITCH_MARGIN = float(os.environ.get("TARGET_SWITCH_MARGIN", "0.18"))
+TARGET_SWITCH_FRAMES = int(os.environ.get("TARGET_SWITCH_FRAMES", "3"))
+TARGET_HOLD_SECONDS = float(os.environ.get("TARGET_HOLD_SECONDS", "0.35"))
+TARGET_SMOOTHING = float(os.environ.get("TARGET_SMOOTHING", "0.35"))
+STEERING_SLEW_RATE = float(os.environ.get("STEERING_SLEW_RATE", "2.0"))
 
 
 def parse_bool(name, value):
@@ -148,6 +154,15 @@ class DetectionDebug:
     priority_area: float = 0.0
     priority_center: float = 0.0
     priority_neighbors: int = 0
+    raw_target_count: int = 0
+    stable_target_locked: bool = False
+    stable_target_held: bool = False
+    stable_target_label: str = "none"
+    stable_target_age: float = 0.0
+    switch_candidate_frames: int = 0
+    raw_steering: float = 0.0
+    smoothed_steering: float = 0.0
+    steering_limited: bool = False
 
 
 def clamp(value, minimum, maximum):
@@ -237,10 +252,6 @@ class TuiDashboard:
             + " tui_interval=" + str(TUI_INTERVAL)
             + " ctrl-c exits and neutralizes outputs",
             "",
-            "[Display]",
-            "detector_window=geometry only; boxes/dots/centerline",
-            "mask_window=disabled; text/debug lives in this TUI",
-            "",
             "[Target]",
         ]
 
@@ -248,6 +259,12 @@ class TuiDashboard:
             lines.extend([
                 "selected=none",
                 "position=n/a area=n/a confidence=n/a",
+                "stable label=" + debug.stable_target_label
+                + " locked=" + str(debug.stable_target_locked)
+                + " held=" + str(debug.stable_target_held)
+                + " age=" + str(round(debug.stable_target_age, 2)),
+                "switch_frames=" + str(debug.switch_candidate_frames)
+                + " raw_targets=" + str(debug.raw_target_count),
             ])
         else:
             lines.extend([
@@ -263,6 +280,12 @@ class TuiDashboard:
                 "priority area=" + str(round(debug.priority_area, 3))
                 + " center=" + str(round(debug.priority_center, 3))
                 + " neighbors=" + str(debug.priority_neighbors),
+                "stable label=" + debug.stable_target_label
+                + " locked=" + str(debug.stable_target_locked)
+                + " held=" + str(debug.stable_target_held)
+                + " age=" + str(round(debug.stable_target_age, 2)),
+                "switch_frames=" + str(debug.switch_candidate_frames)
+                + " raw_targets=" + str(debug.raw_target_count),
             ])
 
         lines.extend([
@@ -272,6 +295,9 @@ class TuiDashboard:
             + " steering=" + str(round(command.steering, 3))
             + " throttle=" + str(round(command.throttle, 3)),
             "reason=" + command.reason,
+            "raw_steering=" + str(round(debug.raw_steering, 3))
+            + " smoothed_steering=" + str(round(debug.smoothed_steering, 3))
+            + " slew_limited=" + str(debug.steering_limited),
             "",
             "[Vision]",
             "active_colors=" + str(debug.active_colors)
@@ -315,6 +341,12 @@ class TuiDashboard:
             + " area=" + str(TARGET_AREA_WEIGHT)
             + " center=" + str(TARGET_CENTER_WEIGHT),
             "priority cluster_radius_ratio=" + str(TARGET_CLUSTER_RADIUS_RATIO),
+            "target lock_radius_ratio=" + str(TARGET_LOCK_RADIUS_RATIO)
+            + " switch_margin=" + str(TARGET_SWITCH_MARGIN)
+            + " switch_frames=" + str(TARGET_SWITCH_FRAMES),
+            "target hold_seconds=" + str(TARGET_HOLD_SECONDS)
+            + " smoothing=" + str(TARGET_SMOOTHING)
+            + " steering_slew_rate=" + str(STEERING_SLEW_RATE),
         ])
 
         return lines
@@ -1885,6 +1917,226 @@ def choose_best_target(targets, frame_width, frame_height, debug=None):
     return best_target
 
 
+class TargetStabilizer:
+    def __init__(self):
+        self.target = None
+        self.last_seen_time = 0
+        self.acquired_time = 0
+        self.switch_candidate = None
+        self.switch_candidate_frames = 0
+
+    def select_target(self, targets, frame_width, frame_height, current_time, debug):
+        debug.raw_target_count = len(targets)
+
+        if len(targets) == 0:
+            return self.hold_or_clear(current_time, debug)
+
+        frame_area = frame_width * frame_height
+        scored_targets = self.score_targets(targets, frame_width, frame_height, frame_area)
+        raw_best_priority, raw_best_target = scored_targets[0]
+        locked_match = self.find_locked_match(targets, frame_width)
+
+        if self.target is None:
+            return self.lock_target(raw_best_target, raw_best_priority, current_time, debug)
+
+        if locked_match is None:
+            if current_time - self.last_seen_time <= TARGET_HOLD_SECONDS:
+                if self.should_switch(raw_best_target, raw_best_priority, None, frame_width):
+                    return self.lock_target(raw_best_target, raw_best_priority, current_time, debug)
+
+                return self.hold_or_clear(current_time, debug)
+
+            return self.lock_target(raw_best_target, raw_best_priority, current_time, debug)
+
+        locked_priority = score_target_priority(
+            locked_match,
+            targets,
+            frame_width,
+            frame_height,
+            frame_area
+        )
+
+        if raw_best_target is not locked_match and self.should_switch(
+            raw_best_target,
+            raw_best_priority,
+            locked_priority,
+            frame_width
+        ):
+            return self.lock_target(raw_best_target, raw_best_priority, current_time, debug)
+
+        self.switch_candidate = None
+        self.switch_candidate_frames = 0
+        return self.lock_target(locked_match, locked_priority, current_time, debug)
+
+    def score_targets(self, targets, frame_width, frame_height, frame_area):
+        scored_targets = []
+
+        for target in targets:
+            priority = score_target_priority(
+                target,
+                targets,
+                frame_width,
+                frame_height,
+                frame_area
+            )
+            scored_targets.append((priority, target))
+
+        return sorted(
+            scored_targets,
+            key=lambda item: (
+                item[0]["score"],
+                item[0]["distance"],
+                item[0]["cluster"],
+                item[1].area,
+                -abs(item[1].center_x - frame_width / 2.0)
+            ),
+            reverse=True
+        )
+
+    def find_locked_match(self, targets, frame_width):
+        if self.target is None:
+            return None
+
+        lock_radius = max(24.0, frame_width * TARGET_LOCK_RADIUS_RATIO)
+        closest_target = None
+        closest_distance = None
+
+        for target in targets:
+            distance = np.hypot(
+                target.center_x - self.target.center_x,
+                target.center_y - self.target.center_y
+            )
+
+            if distance > lock_radius:
+                continue
+
+            if closest_distance is None or distance < closest_distance:
+                closest_target = target
+                closest_distance = distance
+
+        return closest_target
+
+    def should_switch(self, candidate, candidate_priority, current_priority, frame_width):
+        if self.target is None:
+            return True
+
+        current_score = 0.0
+
+        if current_priority is not None:
+            current_score = current_priority["score"]
+
+        if candidate_priority["score"] < current_score + TARGET_SWITCH_MARGIN:
+            self.switch_candidate = None
+            self.switch_candidate_frames = 0
+            return False
+
+        if self.switch_candidate is not None:
+            distance = np.hypot(
+                candidate.center_x - self.switch_candidate.center_x,
+                candidate.center_y - self.switch_candidate.center_y
+            )
+        else:
+            distance = None
+
+        if distance is None or distance > max(24.0, frame_width * TARGET_LOCK_RADIUS_RATIO):
+            self.switch_candidate = candidate
+            self.switch_candidate_frames = 1
+        else:
+            self.switch_candidate = candidate
+            self.switch_candidate_frames += 1
+
+        return self.switch_candidate_frames >= TARGET_SWITCH_FRAMES
+
+    def lock_target(self, target, priority, current_time, debug):
+        if self.target is None:
+            smoothed_target = target
+            self.acquired_time = current_time
+        else:
+            smoothed_target = self.smooth_target(target)
+
+        self.target = smoothed_target
+        self.last_seen_time = current_time
+        self.fill_debug(priority, current_time, False, debug)
+        return self.target
+
+    def smooth_target(self, target):
+        alpha = clamp(TARGET_SMOOTHING, 0.0, 1.0)
+        return VisionTarget(
+            label=target.label,
+            center_x=int(round(self.target.center_x * (1.0 - alpha) + target.center_x * alpha)),
+            center_y=int(round(self.target.center_y * (1.0 - alpha) + target.center_y * alpha)),
+            area=self.target.area * (1.0 - alpha) + target.area * alpha,
+            confidence=self.target.confidence * (1.0 - alpha) + target.confidence * alpha,
+            box=target.box,
+            radius=int(round(self.target.radius * (1.0 - alpha) + target.radius * alpha)),
+            color=target.color
+        )
+
+    def hold_or_clear(self, current_time, debug):
+        if self.target is not None and current_time - self.last_seen_time <= TARGET_HOLD_SECONDS:
+            self.fill_debug(None, current_time, True, debug)
+            return self.target
+
+        self.target = None
+        self.switch_candidate = None
+        self.switch_candidate_frames = 0
+        debug.stable_target_locked = False
+        debug.stable_target_held = False
+        debug.stable_target_label = "none"
+        debug.stable_target_age = 0.0
+        debug.switch_candidate_frames = 0
+        return None
+
+    def fill_debug(self, priority, current_time, held, debug):
+        debug.stable_target_locked = self.target is not None
+        debug.stable_target_held = held
+        debug.stable_target_label = self.target.label if self.target is not None else "none"
+        debug.stable_target_age = current_time - self.acquired_time
+        debug.switch_candidate_frames = self.switch_candidate_frames
+
+        if priority is not None:
+            debug.priority_score = priority["score"]
+            debug.priority_distance = priority["distance"]
+            debug.priority_cluster = priority["cluster"]
+            debug.priority_area = priority["area"]
+            debug.priority_center = priority["center"]
+            debug.priority_neighbors = priority["neighbors"]
+
+
+class DriveStabilizer:
+    def __init__(self):
+        self.last_steering = 0.0
+        self.last_time = 0
+
+    def smooth(self, command, current_time, debug):
+        debug.raw_steering = command.steering
+
+        if self.last_time == 0:
+            self.last_time = current_time
+            self.last_steering = command.steering
+            debug.smoothed_steering = command.steering
+            debug.steering_limited = False
+            return command
+
+        elapsed = max(0.001, current_time - self.last_time)
+        max_change = STEERING_SLEW_RATE * elapsed
+        steering_delta = command.steering - self.last_steering
+        limited_delta = clamp(steering_delta, -max_change, max_change)
+        smoothed_steering = self.last_steering + limited_delta
+
+        self.last_time = current_time
+        self.last_steering = smoothed_steering
+        debug.smoothed_steering = smoothed_steering
+        debug.steering_limited = abs(limited_delta - steering_delta) > 0.001
+
+        return DriveCommand(
+            smoothed_steering,
+            command.throttle,
+            command.mode,
+            command.reason
+        )
+
+
 def make_drive_command(best_target, frame_width, frame_area, last_seen_time, current_time):
     if best_target is None:
         if current_time - last_seen_time <= LOST_TARGET_TIMEOUT:
@@ -1972,6 +2224,20 @@ def print_telemetry(best_target, command, debug):
         + str(round(debug.priority_cluster, 3))
         + " priority_neighbors="
         + str(debug.priority_neighbors)
+        + " stable_locked="
+        + str(debug.stable_target_locked)
+        + " stable_held="
+        + str(debug.stable_target_held)
+        + " stable_label="
+        + debug.stable_target_label
+        + " switch_frames="
+        + str(debug.switch_candidate_frames)
+        + " raw_steering="
+        + str(round(debug.raw_steering, 3))
+        + " smoothed_steering="
+        + str(round(debug.smoothed_steering, 3))
+        + " steering_limited="
+        + str(debug.steering_limited)
     )
 
     if best_target is None:
@@ -2121,6 +2387,10 @@ def draw_detection_area(frame):
         )
 
 
+target_stabilizer = TargetStabilizer()
+drive_stabilizer = DriveStabilizer()
+
+
 try:
     while True:
         ret, frame = camera.read()
@@ -2144,18 +2414,25 @@ try:
         targets, detected_ball_mask, debug = detect_tennis_balls(frame, hsv, active_colors)
         debug.auto_candidates = auto_calibrator.last_candidate_count
         debug.auto_profiles = len(auto_colors)
-        best_target = choose_best_target(targets, frame.shape[1], frame.shape[0], debug)
+        best_target = target_stabilizer.select_target(
+            targets,
+            frame.shape[1],
+            frame.shape[0],
+            current_time,
+            debug
+        )
 
         if best_target is not None:
             last_target_seen_time = current_time
 
-        command = make_drive_command(
+        raw_command = make_drive_command(
             best_target,
             frame.shape[1],
             frame.shape[0] * frame.shape[1],
             last_target_seen_time,
             current_time
         )
+        command = drive_stabilizer.smooth(raw_command, current_time, debug)
         actuators.apply(command)
 
         dashboard.draw(
