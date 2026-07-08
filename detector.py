@@ -65,7 +65,7 @@ class Picamera2Camera:
         config = self.camera.create_preview_configuration(
             main={
                 "size": (width, height),
-                "format": "RGB888"
+                "format": "BGR888"
             }
         )
         self.camera.configure(config)
@@ -73,7 +73,7 @@ class Picamera2Camera:
         self.frame_count = 0
         print("Picamera2 started.")
         print("  configured size:", str(width) + "x" + str(height))
-        print("  configured format: RGB888")
+        print("  configured format: BGR888")
 
     def read(self):
         try:
@@ -95,8 +95,7 @@ class Picamera2Camera:
             print("First Picamera2 frame shape:", frame.shape)
 
         self.frame_count += 1
-        frame = cv2.cvtColor(frame[:, :, :3], cv2.COLOR_RGB2BGR)
-        return True, frame
+        return True, frame[:, :, :3]
 
     def release(self):
         self.camera.stop()
