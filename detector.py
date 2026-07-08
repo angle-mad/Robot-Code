@@ -20,9 +20,13 @@ HEADLESS_REQUEST = os.environ.get("HEADLESS", "auto").lower()
 VALID_HEADLESS_OPTIONS = ("auto", "true", "false")
 STEERING_CHANNEL = int(os.environ.get("STEERING_CHANNEL", "0"))
 THROTTLE_CHANNEL = int(os.environ.get("THROTTLE_CHANNEL", "1"))
-STEERING_CENTER_US = int(os.environ.get("STEERING_CENTER_US", "1500"))
-STEERING_LEFT_US = int(os.environ.get("STEERING_LEFT_US", "1000"))
-STEERING_RIGHT_US = int(os.environ.get("STEERING_RIGHT_US", "2000"))
+STEERING_CENTER_DEGREES = float(os.environ.get("STEERING_CENTER_DEGREES", "105"))
+STEERING_LEFT_DEGREES = float(os.environ.get("STEERING_LEFT_DEGREES", "75"))
+STEERING_RIGHT_DEGREES = float(os.environ.get("STEERING_RIGHT_DEGREES", "135"))
+STEERING_SERVO_MIN_DEGREES = float(os.environ.get("STEERING_SERVO_MIN_DEGREES", "0"))
+STEERING_SERVO_MAX_DEGREES = float(os.environ.get("STEERING_SERVO_MAX_DEGREES", "180"))
+STEERING_SERVO_MIN_US = int(os.environ.get("STEERING_SERVO_MIN_US", "500"))
+STEERING_SERVO_MAX_US = int(os.environ.get("STEERING_SERVO_MAX_US", "2500"))
 THROTTLE_NEUTRAL_US = int(os.environ.get("THROTTLE_NEUTRAL_US", "1500"))
 THROTTLE_FORWARD_US = int(os.environ.get("THROTTLE_FORWARD_US", "1600"))
 THROTTLE_REVERSE_US = int(os.environ.get("THROTTLE_REVERSE_US", "1400"))
@@ -176,6 +180,38 @@ def normalized_to_pulse(command, minimum_us, center_us, maximum_us):
         return int(center_us + (center_us - minimum_us) * command)
 
     return int(center_us + (maximum_us - center_us) * command)
+
+
+def steering_degrees_to_pulse_us(degrees):
+    degrees = clamp(
+        degrees,
+        min(STEERING_SERVO_MIN_DEGREES, STEERING_SERVO_MAX_DEGREES),
+        max(STEERING_SERVO_MIN_DEGREES, STEERING_SERVO_MAX_DEGREES)
+    )
+    degree_span = STEERING_SERVO_MAX_DEGREES - STEERING_SERVO_MIN_DEGREES
+
+    if degree_span == 0:
+        raise ValueError("STEERING_SERVO_MIN_DEGREES and STEERING_SERVO_MAX_DEGREES must differ")
+
+    servo_position = (degrees - STEERING_SERVO_MIN_DEGREES) / degree_span
+    pulse_span = STEERING_SERVO_MAX_US - STEERING_SERVO_MIN_US
+
+    return int(round(STEERING_SERVO_MIN_US + servo_position * pulse_span))
+
+
+def normalized_to_steering_pulse(command):
+    command = clamp(command, -1.0, 1.0)
+
+    if command < 0:
+        steering_degrees = STEERING_CENTER_DEGREES + (
+            STEERING_CENTER_DEGREES - STEERING_LEFT_DEGREES
+        ) * command
+    else:
+        steering_degrees = STEERING_CENTER_DEGREES + (
+            STEERING_RIGHT_DEGREES - STEERING_CENTER_DEGREES
+        ) * command
+
+    return steering_degrees_to_pulse_us(steering_degrees)
 
 
 class TuiDashboard:
@@ -337,6 +373,12 @@ class TuiDashboard:
             "drive gain=" + str(STEERING_GAIN)
             + " deadband=" + str(STEERING_DEADBAND)
             + " max_throttle=" + str(MAX_TRIAL_THROTTLE),
+            "steering degrees L/C/R="
+            + str(STEERING_LEFT_DEGREES)
+            + "/"
+            + str(STEERING_CENTER_DEGREES)
+            + "/"
+            + str(STEERING_RIGHT_DEGREES),
             "priority weights distance=" + str(TARGET_DISTANCE_WEIGHT)
             + " cluster=" + str(TARGET_CLUSTER_WEIGHT)
             + " area=" + str(TARGET_AREA_WEIGHT)
@@ -687,6 +729,7 @@ class Pca9685Actuators:
         self.pca.frequency = 50
         print("PCA9685 actuator output enabled.")
         print("  steering channel:", STEERING_CHANNEL)
+        print("  steering degrees left/center/right:", STEERING_LEFT_DEGREES, STEERING_CENTER_DEGREES, STEERING_RIGHT_DEGREES)
         print("  throttle channel:", THROTTLE_CHANNEL)
         self.neutralize()
 
@@ -698,12 +741,7 @@ class Pca9685Actuators:
         self.pca.channels[channel].duty_cycle = duty_cycle
 
     def apply(self, command):
-        steering_us = normalized_to_pulse(
-            command.steering,
-            STEERING_LEFT_US,
-            STEERING_CENTER_US,
-            STEERING_RIGHT_US
-        )
+        steering_us = normalized_to_steering_pulse(command.steering)
         throttle_us = normalized_to_pulse(
             command.throttle,
             THROTTLE_REVERSE_US,
