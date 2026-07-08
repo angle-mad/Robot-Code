@@ -11,8 +11,21 @@ FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
 CAMERA_BACKEND = os.environ.get("CAMERA_BACKEND", "auto").lower()
 VALID_CAMERA_BACKENDS = ("auto", "picamera2", "opencv")
+PICAMERA2_SWAP_RED_BLUE = os.environ.get("PICAMERA2_SWAP_RED_BLUE", "true").lower()
+VALID_BOOLEAN_OPTIONS = ("true", "false")
 HEADLESS_REQUEST = os.environ.get("HEADLESS", "auto").lower()
 VALID_HEADLESS_OPTIONS = ("auto", "true", "false")
+
+
+def parse_bool(name, value):
+    if value not in VALID_BOOLEAN_OPTIONS:
+        raise ValueError(
+            name
+            + " must be one of: "
+            + ", ".join(VALID_BOOLEAN_OPTIONS)
+        )
+
+    return value == "true"
 
 
 def running_without_display():
@@ -32,6 +45,10 @@ def running_without_display():
 
 
 HEADLESS = running_without_display()
+SWAP_PICAMERA2_RED_BLUE = parse_bool(
+    "PICAMERA2_SWAP_RED_BLUE",
+    PICAMERA2_SWAP_RED_BLUE
+)
 
 
 def list_video_devices():
@@ -74,6 +91,7 @@ class Picamera2Camera:
         print("Picamera2 started.")
         print("  configured size:", str(width) + "x" + str(height))
         print("  configured format: BGR888")
+        print("  swap red/blue:", SWAP_PICAMERA2_RED_BLUE)
 
     def read(self):
         try:
@@ -95,7 +113,12 @@ class Picamera2Camera:
             print("First Picamera2 frame shape:", frame.shape)
 
         self.frame_count += 1
-        return True, frame[:, :, :3]
+        frame = frame[:, :, :3]
+
+        if SWAP_PICAMERA2_RED_BLUE:
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+        return True, frame
 
     def release(self):
         self.camera.stop()
