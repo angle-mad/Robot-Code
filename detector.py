@@ -20,9 +20,9 @@ HEADLESS_REQUEST = os.environ.get("HEADLESS", "auto").lower()
 VALID_HEADLESS_OPTIONS = ("auto", "true", "false")
 STEERING_CHANNEL = int(os.environ.get("STEERING_CHANNEL", "0"))
 THROTTLE_CHANNEL = int(os.environ.get("THROTTLE_CHANNEL", "1"))
-STEERING_CENTER_DEGREES = float(os.environ.get("STEERING_CENTER_DEGREES", "115"))
+STEERING_CENTER_DEGREES = float(os.environ.get("STEERING_CENTER_DEGREES", "110"))
 STEERING_LEFT_DEGREES = float(os.environ.get("STEERING_LEFT_DEGREES", "50"))
-STEERING_RIGHT_DEGREES = float(os.environ.get("STEERING_RIGHT_DEGREES", "180"))
+STEERING_RIGHT_DEGREES = float(os.environ.get("STEERING_RIGHT_DEGREES", "170"))
 STEERING_SERVO_MIN_DEGREES = float(os.environ.get("STEERING_SERVO_MIN_DEGREES", "0"))
 STEERING_SERVO_MAX_DEGREES = float(os.environ.get("STEERING_SERVO_MAX_DEGREES", "180"))
 STEERING_SERVO_MIN_US = int(os.environ.get("STEERING_SERVO_MIN_US", "500"))
@@ -30,7 +30,12 @@ STEERING_SERVO_MAX_US = int(os.environ.get("STEERING_SERVO_MAX_US", "2500"))
 THROTTLE_NEUTRAL_US = int(os.environ.get("THROTTLE_NEUTRAL_US", "1500"))
 THROTTLE_FORWARD_US = int(os.environ.get("THROTTLE_FORWARD_US", "1600"))
 THROTTLE_REVERSE_US = int(os.environ.get("THROTTLE_REVERSE_US", "1400"))
-MAX_TRIAL_THROTTLE = float(os.environ.get("MAX_TRIAL_THROTTLE", "0.18"))
+ESC_ARM_SECONDS = float(os.environ.get("ESC_ARM_SECONDS", "3.0"))
+THROTTLE_HARD_LIMIT = float(os.environ.get("THROTTLE_HARD_LIMIT", "0.12"))
+THROTTLE_MIN_ACTIVE = float(os.environ.get("THROTTLE_MIN_ACTIVE", "0.06"))
+THROTTLE_ALLOW_REVERSE = os.environ.get("THROTTLE_ALLOW_REVERSE", "false").lower()
+ENABLE_THROTTLE_REQUEST = os.environ.get("ENABLE_THROTTLE", "false").lower()
+MAX_TRIAL_THROTTLE = float(os.environ.get("MAX_TRIAL_THROTTLE", "0.10"))
 STEERING_GAIN = float(os.environ.get("STEERING_GAIN", "1.25"))
 STEERING_DEADBAND = float(os.environ.get("STEERING_DEADBAND", "0.06"))
 CLOSE_BALL_AREA_RATIO = float(os.environ.get("CLOSE_BALL_AREA_RATIO", "0.18"))
@@ -107,6 +112,8 @@ AUTO_CALIBRATE = parse_bool(
     AUTO_CALIBRATE_REQUEST
 )
 TUI_ENABLED = parse_bool("TUI", TUI_REQUEST)
+ALLOW_REVERSE_THROTTLE = parse_bool("THROTTLE_ALLOW_REVERSE", THROTTLE_ALLOW_REVERSE)
+ENABLE_THROTTLE = parse_bool("ENABLE_THROTTLE", ENABLE_THROTTLE_REQUEST)
 
 
 @dataclass
@@ -212,6 +219,35 @@ def normalized_to_steering_pulse(command):
         ) * command
 
     return steering_degrees_to_pulse_us(steering_degrees)
+
+
+def normalize_throttle_for_esc(command):
+    if not ENABLE_THROTTLE:
+        return 0.0
+
+    command = clamp(command, -1.0, 1.0)
+
+    if command > 0:
+        throttle = min(command, THROTTLE_HARD_LIMIT)
+
+        if throttle > 0 and throttle < THROTTLE_MIN_ACTIVE:
+            throttle = min(THROTTLE_MIN_ACTIVE, THROTTLE_HARD_LIMIT)
+
+        return throttle
+
+    if command < 0 and ALLOW_REVERSE_THROTTLE:
+        return max(command, -THROTTLE_HARD_LIMIT)
+
+    return 0.0
+
+
+def normalized_to_esc_throttle_pulse(command):
+    return normalized_to_pulse(
+        normalize_throttle_for_esc(command),
+        THROTTLE_REVERSE_US,
+        THROTTLE_NEUTRAL_US,
+        THROTTLE_FORWARD_US
+    )
 
 
 class TuiDashboard:
@@ -335,6 +371,10 @@ class TuiDashboard:
             + " smoothed_steering=" + str(round(debug.smoothed_steering, 3))
             + " slew_limited=" + str(debug.steering_limited),
             self.make_steering_bar(command.steering, terminal_width),
+            "esc safe_throttle=" + str(round(normalize_throttle_for_esc(command.throttle), 3))
+            + " throttle_us=" + str(getattr(actuators, "last_throttle_us", None))
+            + " armed=" + str(getattr(actuators, "esc_armed", False))
+            + " enabled=" + str(ENABLE_THROTTLE),
             "",
             "[Vision]",
             "active_colors=" + str(debug.active_colors)
@@ -379,6 +419,15 @@ class TuiDashboard:
             + str(STEERING_CENTER_DEGREES)
             + "/"
             + str(STEERING_RIGHT_DEGREES),
+            "esc neutral/forward/reverse us="
+            + str(THROTTLE_NEUTRAL_US)
+            + "/"
+            + str(THROTTLE_FORWARD_US)
+            + "/"
+            + str(THROTTLE_REVERSE_US),
+            "esc arm_seconds=" + str(ESC_ARM_SECONDS)
+            + " hard_limit=" + str(THROTTLE_HARD_LIMIT)
+            + " min_active=" + str(THROTTLE_MIN_ACTIVE),
             "priority weights distance=" + str(TARGET_DISTANCE_WEIGHT)
             + " cluster=" + str(TARGET_CLUSTER_WEIGHT)
             + " area=" + str(TARGET_AREA_WEIGHT)
@@ -709,6 +758,9 @@ class Pca9685Actuators:
     def __init__(self):
         self.enabled = ENABLE_ACTUATORS
         self.last_command = None
+        self.esc_armed = False
+        self.last_steering_us = None
+        self.last_throttle_us = None
 
         if not self.enabled:
             print("Actuators disabled. Set ENABLE_ACTUATORS=true to drive PCA9685 outputs.")
@@ -731,7 +783,14 @@ class Pca9685Actuators:
         print("  steering channel:", STEERING_CHANNEL)
         print("  steering degrees left/center/right:", STEERING_LEFT_DEGREES, STEERING_CENTER_DEGREES, STEERING_RIGHT_DEGREES)
         print("  throttle channel:", THROTTLE_CHANNEL)
+        print("  throttle neutral/forward/reverse us:", THROTTLE_NEUTRAL_US, THROTTLE_FORWARD_US, THROTTLE_REVERSE_US)
+        print("  throttle hard limit:", THROTTLE_HARD_LIMIT)
+        print("  throttle minimum active:", THROTTLE_MIN_ACTIVE)
+        print("  throttle movement enabled:", ENABLE_THROTTLE)
+        print("  holding neutral for ESC arm seconds:", ESC_ARM_SECONDS)
         self.neutralize()
+        time.sleep(ESC_ARM_SECONDS)
+        self.esc_armed = True
 
     def set_pulse_us(self, channel, pulse_us):
         if not self.enabled:
@@ -742,27 +801,26 @@ class Pca9685Actuators:
 
     def apply(self, command):
         steering_us = normalized_to_steering_pulse(command.steering)
-        throttle_us = normalized_to_pulse(
-            command.throttle,
-            THROTTLE_REVERSE_US,
-            THROTTLE_NEUTRAL_US,
-            THROTTLE_FORWARD_US
-        )
+        throttle_us = normalized_to_esc_throttle_pulse(command.throttle)
+        safe_throttle = normalize_throttle_for_esc(command.throttle)
         command_state = (
             round(command.steering, 3),
-            round(command.throttle, 3),
+            round(safe_throttle, 3),
             command.mode,
             command.reason,
             steering_us,
             throttle_us
         )
+        self.last_steering_us = steering_us
+        self.last_throttle_us = throttle_us
 
         if command_state != self.last_command and ENABLE_ACTUATORS and not tui_is_active():
             print(
                 "Drive command:",
                 "mode=" + command.mode,
                 "steering=" + str(round(command.steering, 3)),
-                "throttle=" + str(round(command.throttle, 3)),
+                "requested_throttle=" + str(round(command.throttle, 3)),
+                "safe_throttle=" + str(round(safe_throttle, 3)),
                 "steering_us=" + str(steering_us),
                 "throttle_us=" + str(throttle_us),
                 "reason=" + command.reason
@@ -2208,7 +2266,7 @@ def make_drive_command(best_target, frame_width, frame_area, last_seen_time, cur
         throttle = 0.0
         reason = "target close"
     else:
-        throttle = MAX_TRIAL_THROTTLE
+        throttle = min(MAX_TRIAL_THROTTLE, THROTTLE_HARD_LIMIT)
         reason = "seeking " + best_target.label
 
     return DriveCommand(steering, throttle, "assist", reason)

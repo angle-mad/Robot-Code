@@ -72,7 +72,12 @@ STEERING_SERVO_MAX_US=2500
 THROTTLE_NEUTRAL_US=1500
 THROTTLE_FORWARD_US=1600
 THROTTLE_REVERSE_US=1400
-MAX_TRIAL_THROTTLE=0.18
+ESC_ARM_SECONDS=3.0
+ENABLE_THROTTLE=false
+THROTTLE_HARD_LIMIT=0.12
+THROTTLE_MIN_ACTIVE=0.06
+THROTTLE_ALLOW_REVERSE=false
+MAX_TRIAL_THROTTLE=0.10
 STEERING_GAIN=1.25
 STEERING_DEADBAND=0.06
 CLOSE_BALL_AREA_RATIO=0.18
@@ -83,6 +88,8 @@ LOST_TARGET_TIMEOUT=0.5
 
 - Test steering and ESC behavior with wheels off the ground first.
 - Keep `ENABLE_ACTUATORS=false` until PWM ranges are confirmed.
+- For the VXL-3s ESC, start the program before driving and let it hold neutral during `ESC_ARM_SECONDS`.
+- Keep `ENABLE_THROTTLE=false` until the car is lifted or restrained; neutral is still sent for ESC arming.
 - Use Ctrl-C to exit; the program neutralizes steering and throttle in its shutdown path.
 - Add a physical kill switch before any fast or untethered run.
 
