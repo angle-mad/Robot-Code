@@ -24,6 +24,12 @@ Dry-run vision and command telemetry:
 python3 detector.py
 ```
 
+Disable the terminal dashboard and use plain telemetry prints:
+
+```bash
+TUI=false python3 detector.py
+```
+
 Force headless telemetry:
 
 ```bash
@@ -45,6 +51,8 @@ AUTO_CALIBRATION_SATURATION_MIN=35
 AUTO_CALIBRATION_VALUE_MIN=70
 MIN_BALL_AREA_RATIO=0.004
 MAX_BALL_AREA_RATIO=0.15
+TUI=true
+TUI_INTERVAL=0.1
 KNOWN_COLOR_HUE_PADDING=12
 KNOWN_COLOR_SATURATION_MIN=45
 KNOWN_COLOR_VALUE_MIN=60

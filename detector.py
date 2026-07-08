@@ -1,5 +1,6 @@
 import os
 import platform
+import sys
 import time
 import traceback
 from dataclasses import dataclass
@@ -31,6 +32,8 @@ STEERING_DEADBAND = float(os.environ.get("STEERING_DEADBAND", "0.06"))
 CLOSE_BALL_AREA_RATIO = float(os.environ.get("CLOSE_BALL_AREA_RATIO", "0.18"))
 LOST_TARGET_TIMEOUT = float(os.environ.get("LOST_TARGET_TIMEOUT", "0.5"))
 TELEMETRY_INTERVAL = float(os.environ.get("TELEMETRY_INTERVAL", "0.25"))
+TUI_REQUEST = os.environ.get("TUI", "true").lower()
+TUI_INTERVAL = float(os.environ.get("TUI_INTERVAL", "0.1"))
 MIN_BALL_AREA_RATIO = float(os.environ.get("MIN_BALL_AREA_RATIO", "0.004"))
 MAX_BALL_AREA_RATIO = float(os.environ.get("MAX_BALL_AREA_RATIO", "0.15"))
 AUTO_CALIBRATE_REQUEST = os.environ.get("AUTO_CALIBRATE", "true").lower()
@@ -88,6 +91,7 @@ AUTO_CALIBRATE = parse_bool(
     "AUTO_CALIBRATE",
     AUTO_CALIBRATE_REQUEST
 )
+TUI_ENABLED = parse_bool("TUI", TUI_REQUEST)
 
 
 @dataclass
@@ -145,6 +149,152 @@ def normalized_to_pulse(command, minimum_us, center_us, maximum_us):
         return int(center_us + (center_us - minimum_us) * command)
 
     return int(center_us + (maximum_us - center_us) * command)
+
+
+class TuiDashboard:
+    def __init__(self):
+        self.enabled = TUI_ENABLED and sys.stdout.isatty()
+        self.screen = None
+        self.last_draw_time = 0
+
+        if not self.enabled:
+            if TUI_ENABLED:
+                print("TUI disabled because stdout is not a terminal.")
+            return
+
+        try:
+            import curses
+        except ImportError:
+            print("TUI disabled because curses is unavailable.")
+            self.enabled = False
+            return
+
+        self.curses = curses
+        self.screen = curses.initscr()
+        curses.noecho()
+        curses.cbreak()
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        self.screen.nodelay(True)
+        self.screen.keypad(False)
+
+    def close(self):
+        if not self.enabled:
+            return
+
+        self.curses.nocbreak()
+        self.curses.echo()
+        try:
+            self.curses.curs_set(1)
+        except self.curses.error:
+            pass
+        self.curses.endwin()
+        self.enabled = False
+
+    def draw(self, frame, best_target, command, debug, auto_colors, current_time, fps):
+        if not self.enabled:
+            return
+
+        if current_time - self.last_draw_time < TUI_INTERVAL:
+            return
+
+        self.last_draw_time = current_time
+        height, width = self.screen.getmaxyx()
+        lines = self.make_lines(frame, best_target, command, debug, auto_colors, fps)
+        self.screen.erase()
+
+        for index, line in enumerate(lines[:height - 1]):
+            self.screen.addstr(index, 0, line[:max(0, width - 1)])
+
+        self.screen.refresh()
+
+    def make_lines(self, frame, best_target, command, debug, auto_colors, fps):
+        lines = [
+            "Robot Code TUI",
+            "==============",
+            "",
+            "[Status]",
+            "camera=" + CAMERA_BACKEND
+            + " frame=" + str(frame.shape[1]) + "x" + str(frame.shape[0])
+            + " fps=" + str(round(fps, 1))
+            + " headless=" + str(HEADLESS)
+            + " actuators=" + str(ENABLE_ACTUATORS),
+            "auto_calibrate=" + str(AUTO_CALIBRATE)
+            + " tui_interval=" + str(TUI_INTERVAL)
+            + " ctrl-c exits and neutralizes outputs",
+            "",
+            "[Target]",
+        ]
+
+        if best_target is None:
+            lines.extend([
+                "selected=none",
+                "position=n/a area=n/a confidence=n/a",
+            ])
+        else:
+            lines.extend([
+                "selected=" + best_target.label,
+                "position=x:" + str(best_target.center_x)
+                + " y:" + str(best_target.center_y)
+                + " radius:" + str(best_target.radius),
+                "area=" + str(int(best_target.area))
+                + " confidence=" + str(round(best_target.confidence, 2)),
+            ])
+
+        lines.extend([
+            "",
+            "[Drive]",
+            "mode=" + command.mode
+            + " steering=" + str(round(command.steering, 3))
+            + " throttle=" + str(round(command.throttle, 3)),
+            "reason=" + command.reason,
+            "",
+            "[Vision]",
+            "active_colors=" + str(debug.active_colors)
+            + " masks=" + str(debug.masks_checked)
+            + " contours=" + str(debug.contours_seen)
+            + " accepted=" + str(debug.accepted),
+            "reject_small=" + str(debug.rejected_small)
+            + " reject_large=" + str(debug.rejected_large)
+            + " reject_shape=" + str(debug.rejected_shape)
+            + " reject_samples=" + str(debug.rejected_samples),
+            "",
+            "[Auto Calibration]",
+            "candidates=" + str(debug.auto_candidates)
+            + " profiles=" + str(debug.auto_profiles),
+        ])
+
+        if len(auto_colors) == 0:
+            lines.append("profiles=none")
+        else:
+            profile_names = [
+                color["name"]
+                for color in auto_colors[:8]
+            ]
+            lines.append("profiles=" + ", ".join(profile_names))
+
+        lines.extend([
+            "",
+            "[Tuning]",
+            "ball_area_ratio min=" + str(MIN_BALL_AREA_RATIO)
+            + " max=" + str(MAX_BALL_AREA_RATIO)
+            + " close=" + str(CLOSE_BALL_AREA_RATIO),
+            "known_color hue_padding=" + str(KNOWN_COLOR_HUE_PADDING)
+            + " sat_min=" + str(KNOWN_COLOR_SATURATION_MIN)
+            + " value_min=" + str(KNOWN_COLOR_VALUE_MIN),
+            "drive gain=" + str(STEERING_GAIN)
+            + " deadband=" + str(STEERING_DEADBAND)
+            + " max_throttle=" + str(MAX_TRIAL_THROTTLE),
+        ])
+
+        return lines
+
+
+def tui_is_active():
+    dashboard = globals().get("dashboard")
+    return dashboard is not None and dashboard.enabled
 
 
 def hue_distance(first_hue, second_hue):
@@ -431,6 +581,7 @@ def print_camera_debug_header():
     print("  headless:", HEADLESS)
     print("  actuators enabled:", ENABLE_ACTUATORS)
     print("  auto calibration:", AUTO_CALIBRATE)
+    print("  tui requested:", TUI_ENABLED)
     print("  frame size:", str(FRAME_WIDTH) + "x" + str(FRAME_HEIGHT))
     print("  python:", platform.python_version())
     print("  platform:", platform.platform())
@@ -495,7 +646,7 @@ class Pca9685Actuators:
             throttle_us
         )
 
-        if command_state != self.last_command and ENABLE_ACTUATORS:
+        if command_state != self.last_command and ENABLE_ACTUATORS and not tui_is_active():
             print(
                 "Drive command:",
                 "mode=" + command.mode,
@@ -623,6 +774,7 @@ def open_camera(width, height):
 camera = open_camera(FRAME_WIDTH, FRAME_HEIGHT)
 actuators = Pca9685Actuators()
 auto_calibrator = AutoCalibrator()
+dashboard = TuiDashboard()
 window_name = "Tennis Ball Detector"
 last_hsv_sample = None
 last_click = None
@@ -630,6 +782,8 @@ last_assignment = "No color assigned yet"
 current_hsv = None
 last_detection_print_time = 0
 last_target_seen_time = 0
+last_frame_time = 0
+current_fps = 0
 naming_mode = False
 typed_color_name = ""
 delete_mode = False
@@ -1909,10 +2063,18 @@ try:
         ret, frame = camera.read()
 
         if not ret:
+            dashboard.close()
             print_camera_read_failure(camera)
             break
 
         current_time = time.time()
+        if last_frame_time > 0:
+            frame_delta = current_time - last_frame_time
+
+            if frame_delta > 0:
+                current_fps = 1.0 / frame_delta
+
+        last_frame_time = current_time
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         auto_colors = auto_calibrator.update(frame, hsv, current_time)
         active_colors = auto_colors + KNOWN_BALL_COLORS + colors
@@ -1933,7 +2095,17 @@ try:
         )
         actuators.apply(command)
 
-        if current_time - last_detection_print_time >= TELEMETRY_INTERVAL:
+        dashboard.draw(
+            frame,
+            best_target,
+            command,
+            debug,
+            auto_colors,
+            current_time,
+            current_fps
+        )
+
+        if not dashboard.enabled and current_time - last_detection_print_time >= TELEMETRY_INTERVAL:
             print_telemetry(best_target, command, debug)
             last_detection_print_time = current_time
 
@@ -1946,8 +2118,10 @@ try:
             cv2.waitKey(1)
 
 except KeyboardInterrupt:
+    dashboard.close()
     print("Keyboard interrupt received. Neutralizing outputs and exiting.")
 finally:
+    dashboard.close()
     actuators.close()
     camera.release()
 
