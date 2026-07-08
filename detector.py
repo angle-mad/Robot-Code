@@ -237,6 +237,10 @@ class TuiDashboard:
             + " tui_interval=" + str(TUI_INTERVAL)
             + " ctrl-c exits and neutralizes outputs",
             "",
+            "[Display]",
+            "detector_window=geometry only; boxes/dots/centerline",
+            "mask_window=disabled; text/debug lives in this TUI",
+            "",
             "[Target]",
         ]
 
@@ -1936,112 +1940,6 @@ def draw_runtime_overlay(frame, targets, best_target, command, debug):
             target.color,
             -1
         )
-        cv2.putText(
-            frame,
-            target.label + " " + str(round(target.confidence, 2)),
-            (x, max(20, y - 10)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            target.color,
-            2
-        )
-
-    if best_target is None:
-        target_text = "Target: none"
-        error_text = "Error: n/a"
-    else:
-        target_text = (
-            "Target: "
-            + best_target.label
-            + " area="
-            + str(int(best_target.area))
-        )
-        error_text = "Error px: " + str(best_target.center_x - frame_center_x)
-
-    cv2.putText(
-        frame,
-        target_text,
-        (10, 30),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
-        (255, 255, 255),
-        2
-    )
-    cv2.putText(
-        frame,
-        error_text,
-        (10, 60),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
-        (255, 255, 255),
-        2
-    )
-    cv2.putText(
-        frame,
-        (
-            "Drive: steering="
-            + str(round(command.steering, 2))
-            + " throttle="
-            + str(round(command.throttle, 2))
-            + " "
-            + command.reason
-        ),
-        (10, 90),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
-        (255, 255, 255),
-        2
-    )
-    cv2.putText(
-        frame,
-        (
-            "Vision: colors="
-            + str(debug.active_colors)
-            + " contours="
-            + str(debug.contours_seen)
-            + " ok="
-            + str(debug.accepted)
-        ),
-        (10, 120),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
-        (255, 255, 255),
-        2
-    )
-    cv2.putText(
-        frame,
-        (
-            "Rejects: small="
-            + str(debug.rejected_small)
-            + " large="
-            + str(debug.rejected_large)
-            + " shape="
-            + str(debug.rejected_shape)
-            + " sample="
-            + str(debug.rejected_samples)
-            + " overlap="
-            + str(debug.rejected_overlap)
-        ),
-        (10, 150),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
-        (255, 255, 255),
-        2
-    )
-    cv2.putText(
-        frame,
-        (
-            "Auto: candidates="
-            + str(debug.auto_candidates)
-            + " profiles="
-            + str(debug.auto_profiles)
-        ),
-        (10, 180),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
-        (255, 255, 255),
-        2
-    )
 
 
 def print_telemetry(best_target, command, debug):
@@ -2277,7 +2175,6 @@ try:
         if not HEADLESS:
             draw_runtime_overlay(frame, targets, best_target, command, debug)
             cv2.imshow(window_name, frame)
-            cv2.imshow("Detected Ball Mask", detected_ball_mask)
 
             # Keeps OpenCV windows responsive; runtime key input is ignored.
             cv2.waitKey(1)

@@ -24,6 +24,8 @@ Dry-run vision and command telemetry:
 python3 detector.py
 ```
 
+The terminal dashboard is the main information display. The detector window only shows the camera feed with boxes, dots, and the centerline; it does not show text, and the mask window is disabled.
+
 Disable the terminal dashboard and use plain telemetry prints:
 
 ```bash
