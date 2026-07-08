@@ -35,7 +35,6 @@ THROTTLE_HARD_LIMIT = float(os.environ.get("THROTTLE_HARD_LIMIT", "0.12"))
 THROTTLE_MIN_ACTIVE = float(os.environ.get("THROTTLE_MIN_ACTIVE", "0.06"))
 THROTTLE_ALLOW_REVERSE = os.environ.get("THROTTLE_ALLOW_REVERSE", "false").lower()
 ENABLE_THROTTLE_REQUEST = os.environ.get("ENABLE_THROTTLE", "false").lower()
-CALIBRATE_ESC_REQUEST = os.environ.get("CALIBRATE_ESC", "false").lower()
 MAX_TRIAL_THROTTLE = float(os.environ.get("MAX_TRIAL_THROTTLE", "0.10"))
 STEERING_GAIN = float(os.environ.get("STEERING_GAIN", "1.25"))
 STEERING_DEADBAND = float(os.environ.get("STEERING_DEADBAND", "0.06"))
@@ -115,7 +114,6 @@ AUTO_CALIBRATE = parse_bool(
 TUI_ENABLED = parse_bool("TUI", TUI_REQUEST)
 ALLOW_REVERSE_THROTTLE = parse_bool("THROTTLE_ALLOW_REVERSE", THROTTLE_ALLOW_REVERSE)
 ENABLE_THROTTLE = parse_bool("ENABLE_THROTTLE", ENABLE_THROTTLE_REQUEST)
-CALIBRATE_ESC = parse_bool("CALIBRATE_ESC", CALIBRATE_ESC_REQUEST)
 
 
 @dataclass
@@ -246,15 +244,6 @@ def normalize_throttle_for_esc(command):
 def normalized_to_esc_throttle_pulse(command):
     return normalized_to_pulse(
         normalize_throttle_for_esc(command),
-        THROTTLE_REVERSE_US,
-        THROTTLE_NEUTRAL_US,
-        THROTTLE_FORWARD_US
-    )
-
-
-def raw_normalized_to_esc_throttle_pulse(command):
-    return normalized_to_pulse(
-        clamp(command, -1.0, 1.0),
         THROTTLE_REVERSE_US,
         THROTTLE_NEUTRAL_US,
         THROTTLE_FORWARD_US
@@ -841,16 +830,6 @@ class Pca9685Actuators:
         self.set_pulse_us(STEERING_CHANNEL, steering_us)
         self.set_pulse_us(THROTTLE_CHANNEL, throttle_us)
 
-    def set_raw_throttle(self, throttle):
-        throttle_us = raw_normalized_to_esc_throttle_pulse(throttle)
-        self.last_throttle_us = throttle_us
-        print(
-            "ESC calibration throttle:",
-            "command=" + str(throttle),
-            "pulse_us=" + str(throttle_us)
-        )
-        self.set_pulse_us(THROTTLE_CHANNEL, throttle_us)
-
     def neutralize(self):
         self.apply(DriveCommand(0.0, 0.0, "disabled", "neutralize"))
 
@@ -961,31 +940,7 @@ def open_camera(width, height):
     return camera
 
 
-def run_esc_calibration(actuators):
-    print("ESC calibration mode.")
-    print("Make sure the wheels are off the ground and the car is restrained.")
-    print("This mode bypasses normal throttle safety clamps by design.")
-    print()
-    print("Step 1: sending neutral.")
-    actuators.set_raw_throttle(0.0)
-    input("Press Enter to send full forward throttle (1.0).")
-    actuators.set_raw_throttle(1.0)
-    input("Press Enter to send full reverse throttle (-1.0).")
-    actuators.set_raw_throttle(-1.0)
-    input("Press Enter to return to neutral and exit.")
-    actuators.set_raw_throttle(0.0)
-    print("ESC calibration complete. Neutral sent; exiting.")
-
-
 actuators = Pca9685Actuators()
-
-if CALIBRATE_ESC:
-    try:
-        run_esc_calibration(actuators)
-    finally:
-        actuators.close()
-
-    sys.exit(0)
 
 camera = open_camera(FRAME_WIDTH, FRAME_HEIGHT)
 auto_calibrator = AutoCalibrator()
