@@ -44,6 +44,12 @@ Enable real PCA9685 actuator output only after bench testing:
 ENABLE_ACTUATORS=true python3 detector.py
 ```
 
+Run ESC calibration. This intentionally sends full forward and full reverse after Enter prompts:
+
+```bash
+CALIBRATE_ESC=true ENABLE_ACTUATORS=true python3 detector.py
+```
+
 Useful tuning variables:
 
 ```bash
@@ -74,6 +80,7 @@ THROTTLE_FORWARD_US=1600
 THROTTLE_REVERSE_US=1400
 ESC_ARM_SECONDS=3.0
 ENABLE_THROTTLE=false
+CALIBRATE_ESC=false
 THROTTLE_HARD_LIMIT=0.12
 THROTTLE_MIN_ACTIVE=0.06
 THROTTLE_ALLOW_REVERSE=false
@@ -90,6 +97,7 @@ LOST_TARGET_TIMEOUT=0.5
 - Keep `ENABLE_ACTUATORS=false` until PWM ranges are confirmed.
 - For the VXL-3s ESC, start the program before driving and let it hold neutral during `ESC_ARM_SECONDS`.
 - Keep `ENABLE_THROTTLE=false` until the car is lifted or restrained; neutral is still sent for ESC arming.
+- `CALIBRATE_ESC=true` bypasses normal throttle limits; use it only with wheels off the ground.
 - Use Ctrl-C to exit; the program neutralizes steering and throttle in its shutdown path.
 - Add a physical kill switch before any fast or untethered run.
 
