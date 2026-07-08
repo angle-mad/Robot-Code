@@ -229,7 +229,7 @@ class TuiDashboard:
 
         self.last_draw_time = current_time
         height, width = self.screen.getmaxyx()
-        lines = self.make_lines(frame, best_target, command, debug, auto_colors, fps)
+        lines = self.make_lines(frame, best_target, command, debug, auto_colors, fps, width)
         self.screen.erase()
 
         for index, line in enumerate(lines[:height - 1]):
@@ -237,7 +237,7 @@ class TuiDashboard:
 
         self.screen.refresh()
 
-    def make_lines(self, frame, best_target, command, debug, auto_colors, fps):
+    def make_lines(self, frame, best_target, command, debug, auto_colors, fps, terminal_width):
         lines = [
             "Robot Code TUI",
             "==============",
@@ -298,6 +298,7 @@ class TuiDashboard:
             "raw_steering=" + str(round(debug.raw_steering, 3))
             + " smoothed_steering=" + str(round(debug.smoothed_steering, 3))
             + " slew_limited=" + str(debug.steering_limited),
+            self.make_steering_bar(command.steering, terminal_width),
             "",
             "[Vision]",
             "active_colors=" + str(debug.active_colors)
@@ -350,6 +351,18 @@ class TuiDashboard:
         ])
 
         return lines
+
+    def make_steering_bar(self, steering, terminal_width):
+        label = "steering L "
+        suffix = " R"
+        bar_width = max(11, terminal_width - len(label) - len(suffix) - 1)
+        center_index = bar_width // 2
+        marker_index = int(round((clamp(steering, -1.0, 1.0) + 1.0) * 0.5 * (bar_width - 1)))
+        bar = ["-"] * bar_width
+        bar[center_index] = "|"
+        bar[marker_index] = "#"
+
+        return label + "".join(bar) + suffix
 
 
 def tui_is_active():
