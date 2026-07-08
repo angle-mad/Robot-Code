@@ -31,6 +31,17 @@ STEERING_DEADBAND = float(os.environ.get("STEERING_DEADBAND", "0.06"))
 CLOSE_BALL_AREA_RATIO = float(os.environ.get("CLOSE_BALL_AREA_RATIO", "0.18"))
 LOST_TARGET_TIMEOUT = float(os.environ.get("LOST_TARGET_TIMEOUT", "0.5"))
 TELEMETRY_INTERVAL = float(os.environ.get("TELEMETRY_INTERVAL", "0.25"))
+MIN_BALL_AREA_RATIO = float(os.environ.get("MIN_BALL_AREA_RATIO", "0.004"))
+AUTO_CALIBRATE_REQUEST = os.environ.get("AUTO_CALIBRATE", "true").lower()
+AUTO_CALIBRATION_INTERVAL = float(os.environ.get("AUTO_CALIBRATION_INTERVAL", "1.0"))
+AUTO_CALIBRATION_MAX_COLORS = int(os.environ.get("AUTO_CALIBRATION_MAX_COLORS", "8"))
+AUTO_CALIBRATION_MIN_AREA_RATIO = float(os.environ.get("AUTO_CALIBRATION_MIN_AREA_RATIO", "0.006"))
+AUTO_CALIBRATION_SATURATION_MIN = int(os.environ.get("AUTO_CALIBRATION_SATURATION_MIN", "35"))
+AUTO_CALIBRATION_VALUE_MIN = int(os.environ.get("AUTO_CALIBRATION_VALUE_MIN", "70"))
+AUTO_CALIBRATION_HUE_PADDING = int(os.environ.get("AUTO_CALIBRATION_HUE_PADDING", "8"))
+AUTO_CALIBRATION_SATURATION_PADDING = int(os.environ.get("AUTO_CALIBRATION_SATURATION_PADDING", "45"))
+AUTO_CALIBRATION_VALUE_PADDING = int(os.environ.get("AUTO_CALIBRATION_VALUE_PADDING", "45"))
+AUTO_CALIBRATION_MERGE_HUE_DISTANCE = int(os.environ.get("AUTO_CALIBRATION_MERGE_HUE_DISTANCE", "10"))
 
 
 def parse_bool(name, value):
@@ -69,6 +80,10 @@ ENABLE_ACTUATORS = parse_bool(
     "ENABLE_ACTUATORS",
     ENABLE_ACTUATORS_REQUEST
 )
+AUTO_CALIBRATE = parse_bool(
+    "AUTO_CALIBRATE",
+    AUTO_CALIBRATE_REQUEST
+)
 
 
 @dataclass
@@ -91,6 +106,16 @@ class DriveCommand:
     reason: str
 
 
+@dataclass
+class AutoCalibrationProfile:
+    name: str
+    hue: int
+    color_range: dict
+    box_color: tuple
+    last_seen_time: float
+    observations: int
+
+
 def clamp(value, minimum, maximum):
     return max(minimum, min(maximum, value))
 
@@ -102,6 +127,196 @@ def normalized_to_pulse(command, minimum_us, center_us, maximum_us):
         return int(center_us + (center_us - minimum_us) * command)
 
     return int(center_us + (maximum_us - center_us) * command)
+
+
+def hue_distance(first_hue, second_hue):
+    direct_distance = abs(int(first_hue) - int(second_hue))
+    return min(direct_distance, 180 - direct_distance)
+
+
+def make_range_from_hsv_pixels(hsv_pixels):
+    hue_values = hsv_pixels[:, 0].astype(int)
+    saturation_values = hsv_pixels[:, 1].astype(int)
+    value_values = hsv_pixels[:, 2].astype(int)
+    hue = int(np.median(hue_values))
+    saturation = int(np.median(saturation_values))
+    value = int(np.median(value_values))
+
+    return make_range_from_hsv_with_padding(
+        (hue, saturation, value),
+        AUTO_CALIBRATION_HUE_PADDING,
+        AUTO_CALIBRATION_SATURATION_PADDING,
+        AUTO_CALIBRATION_VALUE_PADDING
+    )
+
+
+def make_range_from_hsv_with_padding(hsv_value, hue_padding, saturation_padding, value_padding):
+    hue = int(hsv_value[0])
+    saturation = int(hsv_value[1])
+    value = int(hsv_value[2])
+
+    lower_hue = hue - hue_padding
+    upper_hue = hue + hue_padding
+    lower_saturation = max(0, saturation - saturation_padding)
+    upper_saturation = min(255, saturation + saturation_padding)
+    lower_value = max(0, value - value_padding)
+    upper_value = min(255, value + value_padding)
+
+    if lower_hue < 0:
+        return {
+            "lower": np.array([0, lower_saturation, lower_value]),
+            "upper": np.array([upper_hue, upper_saturation, upper_value]),
+            "lower2": np.array([179 + lower_hue, lower_saturation, lower_value]),
+            "upper2": np.array([179, upper_saturation, upper_value])
+        }
+
+    if upper_hue > 179:
+        return {
+            "lower": np.array([lower_hue, lower_saturation, lower_value]),
+            "upper": np.array([179, upper_saturation, upper_value]),
+            "lower2": np.array([0, lower_saturation, lower_value]),
+            "upper2": np.array([upper_hue - 179, upper_saturation, upper_value])
+        }
+
+    return {
+        "lower": np.array([lower_hue, lower_saturation, lower_value]),
+        "upper": np.array([upper_hue, upper_saturation, upper_value])
+    }
+
+
+class AutoCalibrator:
+    def __init__(self):
+        self.profiles = []
+        self.last_update_time = 0
+
+    def update(self, frame, hsv, current_time):
+        if not AUTO_CALIBRATE:
+            return []
+
+        if current_time - self.last_update_time < AUTO_CALIBRATION_INTERVAL:
+            return self.as_colors()
+
+        self.last_update_time = current_time
+        candidates = self.find_candidates(frame, hsv)
+
+        for candidate in candidates:
+            self.merge_candidate(candidate, current_time)
+
+        return self.as_colors()
+
+    def find_candidates(self, frame, hsv):
+        minimum_area = frame.shape[0] * frame.shape[1] * AUTO_CALIBRATION_MIN_AREA_RATIO
+        saturated_mask = cv2.inRange(
+            hsv,
+            np.array([
+                0,
+                AUTO_CALIBRATION_SATURATION_MIN,
+                AUTO_CALIBRATION_VALUE_MIN
+            ]),
+            np.array([179, 255, 255])
+        )
+        kernel = np.ones((7, 7), np.uint8)
+        saturated_mask = cv2.morphologyEx(saturated_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        saturated_mask = cv2.erode(saturated_mask, None, iterations=1)
+        saturated_mask = cv2.dilate(saturated_mask, None, iterations=2)
+        contours, _ = cv2.findContours(
+            saturated_mask,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE
+        )
+        candidates = []
+
+        for contour in contours:
+            area = cv2.contourArea(contour)
+
+            if area < minimum_area:
+                continue
+
+            x, y, w, h = cv2.boundingRect(contour)
+
+            if not is_spherical(contour, w, h, saturated_mask):
+                continue
+
+            contour_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+            cv2.drawContours(contour_mask, [contour], -1, 255, -1)
+            pixels = hsv[contour_mask == 255]
+
+            if len(pixels) < 30:
+                continue
+
+            hue = int(np.median(pixels[:, 0]))
+            new_range = make_range_from_hsv_pixels(pixels)
+            box_color = make_box_color_from_hsv((
+                hue,
+                int(np.median(pixels[:, 1])),
+                int(np.median(pixels[:, 2]))
+            ))
+            candidates.append(
+                AutoCalibrationProfile(
+                    name="auto-" + str(hue),
+                    hue=hue,
+                    color_range=new_range,
+                    box_color=box_color,
+                    last_seen_time=0,
+                    observations=1
+                )
+            )
+
+        return candidates
+
+    def merge_candidate(self, candidate, current_time):
+        for profile in self.profiles:
+            if hue_distance(profile.hue, candidate.hue) <= AUTO_CALIBRATION_MERGE_HUE_DISTANCE:
+                observations = profile.observations + 1
+                profile.hue = int(
+                    (
+                        profile.hue * profile.observations
+                        + candidate.hue
+                    )
+                    / observations
+                )
+                profile.color_range = candidate.color_range
+                profile.box_color = candidate.box_color
+                profile.last_seen_time = current_time
+                profile.observations = observations
+                return
+
+        candidate.name = "auto-" + str(len(self.profiles) + 1)
+        candidate.last_seen_time = current_time
+        self.profiles.append(candidate)
+        self.profiles = sorted(
+            self.profiles,
+            key=lambda profile: profile.last_seen_time,
+            reverse=True
+        )[:AUTO_CALIBRATION_MAX_COLORS]
+        print(
+            "Auto-calibrated color:",
+            candidate.name,
+            "hue=" + str(candidate.hue),
+            "range=" + array_to_code(candidate.color_range["lower"]),
+            "to",
+            array_to_code(candidate.color_range["upper"])
+        )
+
+    def as_colors(self):
+        auto_colors = []
+
+        for profile in self.profiles:
+            color = {
+                "name": profile.name,
+                "lower": profile.color_range["lower"],
+                "upper": profile.color_range["upper"],
+                "box_color": profile.box_color,
+                "auto_calibrated": True
+            }
+
+            if "lower2" in profile.color_range:
+                color["lower2"] = profile.color_range["lower2"]
+                color["upper2"] = profile.color_range["upper2"]
+
+            auto_colors.append(color)
+
+        return auto_colors
 
 
 def list_video_devices():
@@ -120,6 +335,7 @@ def print_camera_debug_header():
     print("  backend request:", CAMERA_BACKEND)
     print("  headless:", HEADLESS)
     print("  actuators enabled:", ENABLE_ACTUATORS)
+    print("  auto calibration:", AUTO_CALIBRATE)
     print("  frame size:", str(FRAME_WIDTH) + "x" + str(FRAME_HEIGHT))
     print("  python:", platform.python_version())
     print("  platform:", platform.platform())
@@ -311,6 +527,7 @@ def open_camera(width, height):
 
 camera = open_camera(FRAME_WIDTH, FRAME_HEIGHT)
 actuators = Pca9685Actuators()
+auto_calibrator = AutoCalibrator()
 window_name = "Tennis Ball Detector"
 last_hsv_sample = None
 last_click = None
@@ -1174,12 +1391,12 @@ def has_sampled_color_variety(contour, hsv, color):
     return matching_sample_count >= needed_matches
 
 
-def detect_tennis_balls(frame, hsv):
+def detect_tennis_balls(frame, hsv, active_colors):
     targets = []
     detected_ball_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
-    minimum_ball_area = frame.shape[0] * frame.shape[1] * 0.01
+    minimum_ball_area = frame.shape[0] * frame.shape[1] * MIN_BALL_AREA_RATIO
 
-    for color in colors:
+    for color in active_colors:
         mask = make_mask(hsv, color)
         contours, _ = cv2.findContours(
             mask,
@@ -1272,7 +1489,7 @@ def make_drive_command(best_target, frame_width, frame_area, last_seen_time, cur
     return DriveCommand(steering, throttle, "assist", reason)
 
 
-def draw_runtime_overlay(frame, targets, best_target, command):
+def draw_runtime_overlay(frame, targets, best_target, command, auto_color_count):
     frame_center_x = frame.shape[1] // 2
 
     cv2.line(
@@ -1352,6 +1569,15 @@ def draw_runtime_overlay(frame, targets, best_target, command):
             + command.reason
         ),
         (10, 90),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (255, 255, 255),
+        2
+    )
+    cv2.putText(
+        frame,
+        "Auto calibration colors: " + str(auto_color_count),
+        (10, 120),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.7,
         (255, 255, 255),
@@ -1515,7 +1741,9 @@ try:
 
         current_time = time.time()
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        targets, detected_ball_mask = detect_tennis_balls(frame, hsv)
+        auto_colors = auto_calibrator.update(frame, hsv, current_time)
+        active_colors = auto_colors + colors
+        targets, detected_ball_mask = detect_tennis_balls(frame, hsv, active_colors)
         best_target = choose_best_target(targets, frame.shape[1])
 
         if best_target is not None:
@@ -1535,7 +1763,7 @@ try:
             last_detection_print_time = current_time
 
         if not HEADLESS:
-            draw_runtime_overlay(frame, targets, best_target, command)
+            draw_runtime_overlay(frame, targets, best_target, command, len(auto_colors))
             cv2.imshow(window_name, frame)
             cv2.imshow("Detected Ball Mask", detected_ball_mask)
 
