@@ -2,6 +2,7 @@ import os
 import platform
 import time
 import traceback
+from dataclasses import dataclass
 
 import cv2
 import numpy as np
@@ -12,9 +13,24 @@ FRAME_HEIGHT = 480
 CAMERA_BACKEND = os.environ.get("CAMERA_BACKEND", "auto").lower()
 VALID_CAMERA_BACKENDS = ("auto", "picamera2", "opencv")
 PICAMERA2_SWAP_RED_BLUE = os.environ.get("PICAMERA2_SWAP_RED_BLUE", "true").lower()
+ENABLE_ACTUATORS_REQUEST = os.environ.get("ENABLE_ACTUATORS", "false").lower()
 VALID_BOOLEAN_OPTIONS = ("true", "false")
 HEADLESS_REQUEST = os.environ.get("HEADLESS", "auto").lower()
 VALID_HEADLESS_OPTIONS = ("auto", "true", "false")
+STEERING_CHANNEL = int(os.environ.get("STEERING_CHANNEL", "0"))
+THROTTLE_CHANNEL = int(os.environ.get("THROTTLE_CHANNEL", "1"))
+STEERING_CENTER_US = int(os.environ.get("STEERING_CENTER_US", "1500"))
+STEERING_LEFT_US = int(os.environ.get("STEERING_LEFT_US", "1000"))
+STEERING_RIGHT_US = int(os.environ.get("STEERING_RIGHT_US", "2000"))
+THROTTLE_NEUTRAL_US = int(os.environ.get("THROTTLE_NEUTRAL_US", "1500"))
+THROTTLE_FORWARD_US = int(os.environ.get("THROTTLE_FORWARD_US", "1600"))
+THROTTLE_REVERSE_US = int(os.environ.get("THROTTLE_REVERSE_US", "1400"))
+MAX_TRIAL_THROTTLE = float(os.environ.get("MAX_TRIAL_THROTTLE", "0.18"))
+STEERING_GAIN = float(os.environ.get("STEERING_GAIN", "1.25"))
+STEERING_DEADBAND = float(os.environ.get("STEERING_DEADBAND", "0.06"))
+CLOSE_BALL_AREA_RATIO = float(os.environ.get("CLOSE_BALL_AREA_RATIO", "0.18"))
+LOST_TARGET_TIMEOUT = float(os.environ.get("LOST_TARGET_TIMEOUT", "0.5"))
+TELEMETRY_INTERVAL = float(os.environ.get("TELEMETRY_INTERVAL", "0.25"))
 
 
 def parse_bool(name, value):
@@ -49,6 +65,43 @@ SWAP_PICAMERA2_RED_BLUE = parse_bool(
     "PICAMERA2_SWAP_RED_BLUE",
     PICAMERA2_SWAP_RED_BLUE
 )
+ENABLE_ACTUATORS = parse_bool(
+    "ENABLE_ACTUATORS",
+    ENABLE_ACTUATORS_REQUEST
+)
+
+
+@dataclass
+class VisionTarget:
+    label: str
+    center_x: int
+    center_y: int
+    area: float
+    confidence: float
+    box: tuple
+    radius: int
+    color: tuple
+
+
+@dataclass
+class DriveCommand:
+    steering: float
+    throttle: float
+    mode: str
+    reason: str
+
+
+def clamp(value, minimum, maximum):
+    return max(minimum, min(maximum, value))
+
+
+def normalized_to_pulse(command, minimum_us, center_us, maximum_us):
+    command = clamp(command, -1.0, 1.0)
+
+    if command < 0:
+        return int(center_us + (center_us - minimum_us) * command)
+
+    return int(center_us + (maximum_us - center_us) * command)
 
 
 def list_video_devices():
@@ -66,12 +119,94 @@ def print_camera_debug_header():
     print("Camera debug:")
     print("  backend request:", CAMERA_BACKEND)
     print("  headless:", HEADLESS)
+    print("  actuators enabled:", ENABLE_ACTUATORS)
     print("  frame size:", str(FRAME_WIDTH) + "x" + str(FRAME_HEIGHT))
     print("  python:", platform.python_version())
     print("  platform:", platform.platform())
     print("  opencv:", cv2.__version__)
     print("  /dev video devices:", ", ".join(list_video_devices()) or "none")
     print()
+
+
+class Pca9685Actuators:
+    def __init__(self):
+        self.enabled = ENABLE_ACTUATORS
+        self.last_command = None
+
+        if not self.enabled:
+            print("Actuators disabled. Set ENABLE_ACTUATORS=true to drive PCA9685 outputs.")
+            return
+
+        try:
+            import board
+            import busio
+            from adafruit_pca9685 import PCA9685
+        except ImportError:
+            print("PCA9685 libraries are missing. Install with:")
+            print("  sudo apt install -y python3-pip")
+            print("  pip3 install adafruit-circuitpython-pca9685")
+            raise
+
+        i2c = busio.I2C(board.SCL, board.SDA)
+        self.pca = PCA9685(i2c)
+        self.pca.frequency = 50
+        print("PCA9685 actuator output enabled.")
+        print("  steering channel:", STEERING_CHANNEL)
+        print("  throttle channel:", THROTTLE_CHANNEL)
+        self.neutralize()
+
+    def set_pulse_us(self, channel, pulse_us):
+        if not self.enabled:
+            return
+
+        duty_cycle = int(clamp(pulse_us * 50 * 65535 / 1000000, 0, 65535))
+        self.pca.channels[channel].duty_cycle = duty_cycle
+
+    def apply(self, command):
+        steering_us = normalized_to_pulse(
+            command.steering,
+            STEERING_LEFT_US,
+            STEERING_CENTER_US,
+            STEERING_RIGHT_US
+        )
+        throttle_us = normalized_to_pulse(
+            command.throttle,
+            THROTTLE_REVERSE_US,
+            THROTTLE_NEUTRAL_US,
+            THROTTLE_FORWARD_US
+        )
+        command_state = (
+            round(command.steering, 3),
+            round(command.throttle, 3),
+            command.mode,
+            command.reason,
+            steering_us,
+            throttle_us
+        )
+
+        if command_state != self.last_command:
+            print(
+                "Drive command:",
+                "mode=" + command.mode,
+                "steering=" + str(round(command.steering, 3)),
+                "throttle=" + str(round(command.throttle, 3)),
+                "steering_us=" + str(steering_us),
+                "throttle_us=" + str(throttle_us),
+                "reason=" + command.reason
+            )
+            self.last_command = command_state
+
+        self.set_pulse_us(STEERING_CHANNEL, steering_us)
+        self.set_pulse_us(THROTTLE_CHANNEL, throttle_us)
+
+    def neutralize(self):
+        self.apply(DriveCommand(0.0, 0.0, "disabled", "neutralize"))
+
+    def close(self):
+        self.neutralize()
+
+        if self.enabled:
+            self.pca.deinit()
 
 
 class Picamera2Camera:
@@ -175,12 +310,14 @@ def open_camera(width, height):
 
 
 camera = open_camera(FRAME_WIDTH, FRAME_HEIGHT)
+actuators = Pca9685Actuators()
 window_name = "Tennis Ball Detector"
 last_hsv_sample = None
 last_click = None
 last_assignment = "No color assigned yet"
 current_hsv = None
 last_detection_print_time = 0
+last_target_seen_time = 0
 naming_mode = False
 typed_color_name = ""
 delete_mode = False
@@ -192,25 +329,6 @@ roi_start = None
 roi_end = None
 roi_box = None
 
-
-def print_camera_read_failure(camera):
-    print("Could not access camera")
-    print("Camera read failure debug:")
-    print("  selected backend:", type(camera).__name__)
-
-    if hasattr(camera, "isOpened"):
-        print("  opencv isOpened:", camera.isOpened())
-        print("  opencv backend:", camera.getBackendName() if camera.isOpened() else "none")
-        print("  opencv width:", camera.get(cv2.CAP_PROP_FRAME_WIDTH))
-        print("  opencv height:", camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-    print("  /dev video devices:", ", ".join(list_video_devices()) or "none")
-    print()
-    print("Try these on the Pi for more context:")
-    print("  CAMERA_BACKEND=picamera2 python3 detector.py")
-    print("  python3 -c \"from picamera2 import Picamera2; print(Picamera2.global_camera_info())\"")
-    print("  libcamera-hello --list-cameras")
-    print()
 
 def print_camera_read_failure(camera):
     print("Could not access camera")
@@ -773,7 +891,7 @@ def show_hsv_value(event, x, y, flags, param):
 
 if not HEADLESS:
     cv2.namedWindow(window_name)
-    cv2.setMouseCallback(window_name, show_hsv_value)
+    print("Visualization window enabled. Runtime mouse/key calibration is disabled.")
 else:
     print("Running headless: camera windows and mouse calibration are disabled.")
 
@@ -1056,6 +1174,215 @@ def has_sampled_color_variety(contour, hsv, color):
     return matching_sample_count >= needed_matches
 
 
+def detect_tennis_balls(frame, hsv):
+    targets = []
+    detected_ball_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+    minimum_ball_area = frame.shape[0] * frame.shape[1] * 0.01
+
+    for color in colors:
+        mask = make_mask(hsv, color)
+        contours, _ = cv2.findContours(
+            mask,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        for contour in contours:
+            area = cv2.contourArea(contour)
+
+            if area <= minimum_ball_area:
+                continue
+
+            x, y, w, h = cv2.boundingRect(contour)
+
+            if not is_spherical(contour, w, h, mask):
+                continue
+
+            if not has_sampled_color_variety(contour, hsv, color):
+                continue
+
+            center_x = x + w // 2
+            center_y = y + h // 2
+            radius = int(max(w, h) / 2)
+            confidence = clamp(area / float(frame.shape[0] * frame.shape[1] * 0.12), 0.0, 1.0)
+
+            cv2.circle(
+                detected_ball_mask,
+                (center_x, center_y),
+                radius,
+                255,
+                -1
+            )
+
+            targets.append(
+                VisionTarget(
+                    label=color["name"],
+                    center_x=center_x,
+                    center_y=center_y,
+                    area=area,
+                    confidence=confidence,
+                    box=(x, y, w, h),
+                    radius=radius,
+                    color=color["box_color"]
+                )
+            )
+
+    return targets, detected_ball_mask
+
+
+def choose_best_target(targets, frame_width):
+    if len(targets) == 0:
+        return None
+
+    frame_center_x = frame_width / 2.0
+
+    return sorted(
+        targets,
+        key=lambda target: (
+            target.area,
+            -abs(target.center_x - frame_center_x)
+        ),
+        reverse=True
+    )[0]
+
+
+def make_drive_command(best_target, frame_width, frame_area, last_seen_time, current_time):
+    if best_target is None:
+        if current_time - last_seen_time <= LOST_TARGET_TIMEOUT:
+            return DriveCommand(0.0, 0.0, "assist", "coasting after recent target")
+
+        return DriveCommand(0.0, 0.0, "assist", "no target")
+
+    normalized_error = (best_target.center_x - frame_width / 2.0) / (frame_width / 2.0)
+
+    if abs(normalized_error) < STEERING_DEADBAND:
+        steering = 0.0
+    else:
+        steering = clamp(normalized_error * STEERING_GAIN, -1.0, 1.0)
+
+    area_ratio = best_target.area / float(frame_area)
+
+    if area_ratio >= CLOSE_BALL_AREA_RATIO:
+        throttle = 0.0
+        reason = "target close"
+    else:
+        throttle = MAX_TRIAL_THROTTLE
+        reason = "seeking " + best_target.label
+
+    return DriveCommand(steering, throttle, "assist", reason)
+
+
+def draw_runtime_overlay(frame, targets, best_target, command):
+    frame_center_x = frame.shape[1] // 2
+
+    cv2.line(
+        frame,
+        (frame_center_x, 0),
+        (frame_center_x, frame.shape[0]),
+        (255, 255, 255),
+        1
+    )
+
+    for target in targets:
+        x, y, w, h = target.box
+        thickness = 4 if target == best_target else 2
+
+        cv2.rectangle(
+            frame,
+            (x, y),
+            (x + w, y + h),
+            target.color,
+            thickness
+        )
+        cv2.circle(
+            frame,
+            (target.center_x, target.center_y),
+            5,
+            target.color,
+            -1
+        )
+        cv2.putText(
+            frame,
+            target.label + " " + str(round(target.confidence, 2)),
+            (x, max(20, y - 10)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            target.color,
+            2
+        )
+
+    if best_target is None:
+        target_text = "Target: none"
+        error_text = "Error: n/a"
+    else:
+        target_text = (
+            "Target: "
+            + best_target.label
+            + " area="
+            + str(int(best_target.area))
+        )
+        error_text = "Error px: " + str(best_target.center_x - frame_center_x)
+
+    cv2.putText(
+        frame,
+        target_text,
+        (10, 30),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (255, 255, 255),
+        2
+    )
+    cv2.putText(
+        frame,
+        error_text,
+        (10, 60),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (255, 255, 255),
+        2
+    )
+    cv2.putText(
+        frame,
+        (
+            "Drive: steering="
+            + str(round(command.steering, 2))
+            + " throttle="
+            + str(round(command.throttle, 2))
+            + " "
+            + command.reason
+        ),
+        (10, 90),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (255, 255, 255),
+        2
+    )
+
+
+def print_telemetry(best_target, command):
+    if best_target is None:
+        print(
+            "Telemetry:",
+            "target=none",
+            "steering=" + str(round(command.steering, 3)),
+            "throttle=" + str(round(command.throttle, 3)),
+            "reason=" + command.reason
+        )
+        return
+
+    print(
+        "Telemetry:",
+        "target=" + best_target.label,
+        "x=" + str(best_target.center_x),
+        "y=" + str(best_target.center_y),
+        "area=" + str(int(best_target.area)),
+        "confidence=" + str(round(best_target.confidence, 2)),
+        "steering=" + str(round(command.steering, 3)),
+        "throttle=" + str(round(command.throttle, 3)),
+        "reason=" + command.reason
+    )
+
+
 def draw_calibration_menu(frame):
     cv2.putText(
         frame,
@@ -1178,180 +1505,48 @@ def draw_detection_area(frame):
         )
 
 
-while True:
+try:
+    while True:
+        ret, frame = camera.read()
 
-    # Get image from webcam
-    ret, frame = camera.read()
+        if not ret:
+            print_camera_read_failure(camera)
+            break
 
-    if not ret:
-        print_camera_read_failure(camera)
-        print_camera_read_failure(camera)
-        break
+        current_time = time.time()
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        targets, detected_ball_mask = detect_tennis_balls(frame, hsv)
+        best_target = choose_best_target(targets, frame.shape[1])
 
+        if best_target is not None:
+            last_target_seen_time = current_time
 
-    # Convert camera image to HSV
-    current_hsv = None
-    hsv = cv2.cvtColor(
-        frame,
-        cv2.COLOR_BGR2HSV
-    )
-    current_hsv = hsv
-
-
-    detected_ball_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
-    current_time = time.time()
-
-    for color in colors:
-
-        mask = make_mask(hsv, color)
-
-
-        # Find objects
-        contours, _ = cv2.findContours(
-            mask,
-            cv2.RETR_EXTERNAL,
-            cv2.CHAIN_APPROX_SIMPLE
+        command = make_drive_command(
+            best_target,
+            frame.shape[1],
+            frame.shape[0] * frame.shape[1],
+            last_target_seen_time,
+            current_time
         )
+        actuators.apply(command)
 
+        if current_time - last_detection_print_time >= TELEMETRY_INTERVAL:
+            print_telemetry(best_target, command)
+            last_detection_print_time = current_time
 
-        for contour in contours:
+        if not HEADLESS:
+            draw_runtime_overlay(frame, targets, best_target, command)
+            cv2.imshow(window_name, frame)
+            cv2.imshow("Detected Ball Mask", detected_ball_mask)
 
-            area = cv2.contourArea(contour)
+            # Keeps OpenCV windows responsive; runtime key input is ignored.
+            cv2.waitKey(1)
 
-
-            minimum_ball_area = frame.shape[0] * frame.shape[1] * 0.01
-
-            # Ignore small objects
-            if area > minimum_ball_area:
-
-                x, y, w, h = cv2.boundingRect(contour)
-
-                # Only highlight objects that look round like a ball.
-                if not is_spherical(contour, w, h, mask):
-                    continue
-
-                # The object must contain multiple sampled shades from the ball.
-                if not has_sampled_color_variety(contour, hsv, color):
-                    continue
-
-                # Draw box around the detected color
-                cv2.rectangle(
-                    frame,
-                    (x, y),
-                    (x+w, y+h),
-                    color["box_color"],
-                    3
-                )
-
-
-                # Find center
-                center_x = x + w//2
-                center_y = y + h//2
-
-                radius = int(max(w, h) / 2)
-
-                cv2.circle(
-                    detected_ball_mask,
-                    (center_x, center_y),
-                    radius,
-                    255,
-                    -1
-                )
-
-
-                cv2.circle(
-                    frame,
-                    (center_x, center_y),
-                    5,
-                    color["box_color"],
-                    -1
-                )
-
-
-                cv2.putText(
-                    frame,
-                    color["name"],
-                    (x,y-10),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8,
-                    color["box_color"],
-                    2
-                )
-
-                if HEADLESS and current_time - last_detection_print_time > 1:
-                    print(
-                        "Detected",
-                        color["name"],
-                        "at x=" + str(center_x),
-                        "y=" + str(center_y)
-                    )
-                    last_detection_print_time = current_time
-
+except KeyboardInterrupt:
+    print("Keyboard interrupt received. Neutralizing outputs and exiting.")
+finally:
+    actuators.close()
+    camera.release()
 
     if not HEADLESS:
-        draw_calibration_menu(frame)
-        draw_detection_area(frame)
-
-
-    if not HEADLESS and last_hsv_sample is not None and last_click is not None:
-
-        cv2.circle(
-            frame,
-            last_click,
-            8,
-            (255, 255, 255),
-            2
-        )
-
-        hsv_text = (
-            "HSV: H="
-            + str(last_hsv_sample[0])
-            + " S="
-            + str(last_hsv_sample[1])
-            + " V="
-            + str(last_hsv_sample[2])
-        )
-
-        cv2.putText(
-            frame,
-            hsv_text,
-            (10, frame.shape[0] - 20),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (255, 255, 255),
-            2
-        )
-
-
-    if not HEADLESS:
-        # Show camera
-        cv2.imshow(
-            window_name,
-            frame
-        )
-
-
-        # Show mask
-        cv2.imshow(
-            "Detected Ball Mask",
-            detected_ball_mask
-        )
-
-
-        key = cv2.waitKey(1) & 0xFF
-    else:
-        key = 255
-
-    if key != 255:
-        handle_key(key)
-
-
-    # Press Q to quit
-    if not naming_mode and not delete_mode and key == ord("q"):
-        break
-
-
-camera.release()
-
-if not HEADLESS:
-    cv2.destroyAllWindows()
+        cv2.destroyAllWindows()
