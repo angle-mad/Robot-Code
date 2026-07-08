@@ -133,6 +133,7 @@ class DetectionDebug:
     rejected_large: int = 0
     rejected_shape: int = 0
     rejected_samples: int = 0
+    rejected_overlap: int = 0
     accepted: int = 0
     auto_candidates: int = 0
     auto_profiles: int = 0
@@ -259,7 +260,8 @@ class TuiDashboard:
             "reject_small=" + str(debug.rejected_small)
             + " reject_large=" + str(debug.rejected_large)
             + " reject_shape=" + str(debug.rejected_shape)
-            + " reject_samples=" + str(debug.rejected_samples),
+            + " reject_samples=" + str(debug.rejected_samples)
+            + " reject_overlap=" + str(debug.rejected_overlap),
             "",
             "[Auto Calibration]",
             "candidates=" + str(debug.auto_candidates)
@@ -1644,6 +1646,51 @@ def has_sampled_color_variety(contour, hsv, color):
     return matching_sample_count >= needed_matches
 
 
+def box_area(box):
+    return max(0, box[2]) * max(0, box[3])
+
+
+def box_intersection_area(first_box, second_box):
+    first_x, first_y, first_w, first_h = first_box
+    second_x, second_y, second_w, second_h = second_box
+
+    left = max(first_x, second_x)
+    top = max(first_y, second_y)
+    right = min(first_x + first_w, second_x + second_w)
+    bottom = min(first_y + first_h, second_y + second_h)
+
+    return max(0, right - left) * max(0, bottom - top)
+
+
+def boxes_nearly_duplicate(first_box, second_box):
+    intersection = box_intersection_area(first_box, second_box)
+    if intersection == 0:
+        return False
+
+    smaller_area = min(box_area(first_box), box_area(second_box))
+    if smaller_area <= 0:
+        return False
+
+    return intersection / float(smaller_area) >= 0.85
+
+
+def cull_overlapping_targets(targets):
+    kept_targets = []
+    sorted_targets = sorted(
+        targets,
+        key=lambda target: target.area,
+        reverse=True
+    )
+
+    for target in sorted_targets:
+        if any(boxes_nearly_duplicate(target.box, kept_target.box) for kept_target in kept_targets):
+            continue
+
+        kept_targets.append(target)
+
+    return kept_targets
+
+
 def detect_tennis_balls(frame, hsv, active_colors):
     targets = []
     detected_ball_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
@@ -1708,6 +1755,11 @@ def detect_tennis_balls(frame, hsv, active_colors):
                 )
             )
             debug.accepted += 1
+
+    raw_target_count = len(targets)
+    targets = cull_overlapping_targets(targets)
+    debug.rejected_overlap = raw_target_count - len(targets)
+    debug.accepted = len(targets)
 
     return targets, detected_ball_mask, debug
 
@@ -1866,6 +1918,8 @@ def draw_runtime_overlay(frame, targets, best_target, command, debug):
             + str(debug.rejected_shape)
             + " sample="
             + str(debug.rejected_samples)
+            + " overlap="
+            + str(debug.rejected_overlap)
         ),
         (10, 150),
         cv2.FONT_HERSHEY_SIMPLEX,
@@ -1905,6 +1959,8 @@ def print_telemetry(best_target, command, debug):
         + str(debug.rejected_shape)
         + " sample="
         + str(debug.rejected_samples)
+        + " overlap="
+        + str(debug.rejected_overlap)
         + " auto_candidates="
         + str(debug.auto_candidates)
         + " auto_profiles="
