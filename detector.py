@@ -32,6 +32,7 @@ CLOSE_BALL_AREA_RATIO = float(os.environ.get("CLOSE_BALL_AREA_RATIO", "0.18"))
 LOST_TARGET_TIMEOUT = float(os.environ.get("LOST_TARGET_TIMEOUT", "0.5"))
 TELEMETRY_INTERVAL = float(os.environ.get("TELEMETRY_INTERVAL", "0.25"))
 MIN_BALL_AREA_RATIO = float(os.environ.get("MIN_BALL_AREA_RATIO", "0.004"))
+MAX_BALL_AREA_RATIO = float(os.environ.get("MAX_BALL_AREA_RATIO", "0.15"))
 AUTO_CALIBRATE_REQUEST = os.environ.get("AUTO_CALIBRATE", "true").lower()
 AUTO_CALIBRATION_INTERVAL = float(os.environ.get("AUTO_CALIBRATION_INTERVAL", "1.0"))
 AUTO_CALIBRATION_MAX_COLORS = int(os.environ.get("AUTO_CALIBRATION_MAX_COLORS", "8"))
@@ -125,6 +126,7 @@ class DetectionDebug:
     masks_checked: int = 0
     contours_seen: int = 0
     rejected_small: int = 0
+    rejected_large: int = 0
     rejected_shape: int = 0
     rejected_samples: int = 0
     accepted: int = 0
@@ -1492,6 +1494,7 @@ def detect_tennis_balls(frame, hsv, active_colors):
     targets = []
     detected_ball_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
     minimum_ball_area = frame.shape[0] * frame.shape[1] * MIN_BALL_AREA_RATIO
+    maximum_ball_area = frame.shape[0] * frame.shape[1] * MAX_BALL_AREA_RATIO
     debug = DetectionDebug(active_colors=len(active_colors))
 
     for color in active_colors:
@@ -1509,6 +1512,10 @@ def detect_tennis_balls(frame, hsv, active_colors):
 
             if area <= minimum_ball_area:
                 debug.rejected_small += 1
+                continue
+
+            if area >= maximum_ball_area:
+                debug.rejected_large += 1
                 continue
 
             x, y, w, h = cv2.boundingRect(contour)
@@ -1699,6 +1706,8 @@ def draw_runtime_overlay(frame, targets, best_target, command, debug):
         (
             "Rejects: small="
             + str(debug.rejected_small)
+            + " large="
+            + str(debug.rejected_large)
             + " shape="
             + str(debug.rejected_shape)
             + " sample="
@@ -1736,6 +1745,8 @@ def print_telemetry(best_target, command, debug):
         + str(debug.accepted)
         + " small="
         + str(debug.rejected_small)
+        + " large="
+        + str(debug.rejected_large)
         + " shape="
         + str(debug.rejected_shape)
         + " sample="
