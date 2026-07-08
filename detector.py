@@ -42,6 +42,9 @@ AUTO_CALIBRATION_HUE_PADDING = int(os.environ.get("AUTO_CALIBRATION_HUE_PADDING"
 AUTO_CALIBRATION_SATURATION_PADDING = int(os.environ.get("AUTO_CALIBRATION_SATURATION_PADDING", "45"))
 AUTO_CALIBRATION_VALUE_PADDING = int(os.environ.get("AUTO_CALIBRATION_VALUE_PADDING", "45"))
 AUTO_CALIBRATION_MERGE_HUE_DISTANCE = int(os.environ.get("AUTO_CALIBRATION_MERGE_HUE_DISTANCE", "10"))
+KNOWN_COLOR_HUE_PADDING = int(os.environ.get("KNOWN_COLOR_HUE_PADDING", "12"))
+KNOWN_COLOR_SATURATION_MIN = int(os.environ.get("KNOWN_COLOR_SATURATION_MIN", "45"))
+KNOWN_COLOR_VALUE_MIN = int(os.environ.get("KNOWN_COLOR_VALUE_MIN", "60"))
 
 
 def parse_bool(name, value):
@@ -116,6 +119,19 @@ class AutoCalibrationProfile:
     observations: int
 
 
+@dataclass
+class DetectionDebug:
+    active_colors: int = 0
+    masks_checked: int = 0
+    contours_seen: int = 0
+    rejected_small: int = 0
+    rejected_shape: int = 0
+    rejected_samples: int = 0
+    accepted: int = 0
+    auto_candidates: int = 0
+    auto_profiles: int = 0
+
+
 def clamp(value, minimum, maximum):
     return max(minimum, min(maximum, value))
 
@@ -184,10 +200,81 @@ def make_range_from_hsv_with_padding(hsv_value, hue_padding, saturation_padding,
     }
 
 
+KNOWN_BALL_COLOR_SPECS = [
+    ("red", 0, (0, 0, 255)),
+    ("orange", 10, (0, 140, 255)),
+    ("yellow", 30, (0, 255, 255)),
+    ("green", 60, (0, 255, 0)),
+    ("blue", 110, (255, 0, 0)),
+    ("purple", 135, (255, 0, 180)),
+    ("pink", 160, (255, 0, 255)),
+]
+
+
+def make_known_ball_colors():
+    known_colors = []
+
+    for name, hue, box_color in KNOWN_BALL_COLOR_SPECS:
+        color_range = make_range_from_hsv_with_padding(
+            (hue, 150, 160),
+            KNOWN_COLOR_HUE_PADDING,
+            255 - KNOWN_COLOR_SATURATION_MIN,
+            255 - KNOWN_COLOR_VALUE_MIN
+        )
+        color_range["lower"][2] = max(
+            int(color_range["lower"][2]),
+            KNOWN_COLOR_VALUE_MIN
+        )
+
+        if "lower2" in color_range:
+            color_range["lower2"][2] = max(
+                int(color_range["lower2"][2]),
+                KNOWN_COLOR_VALUE_MIN
+            )
+
+        color = {
+            "name": name,
+            "lower": color_range["lower"],
+            "upper": color_range["upper"],
+            "box_color": box_color,
+            "known_ball_color": True,
+            "min_detection_saturation": KNOWN_COLOR_SATURATION_MIN
+        }
+
+        if "lower2" in color_range:
+            color["lower2"] = color_range["lower2"]
+            color["upper2"] = color_range["upper2"]
+
+        known_colors.append(color)
+
+    return known_colors
+
+
+KNOWN_BALL_COLORS = make_known_ball_colors()
+
+
+def classify_known_ball_hue(hue):
+    closest_name = None
+    closest_distance = 999
+
+    for name, known_hue, _ in KNOWN_BALL_COLOR_SPECS:
+        distance = hue_distance(hue, known_hue)
+
+        if distance < closest_distance:
+            closest_name = name
+            closest_distance = distance
+
+    if closest_distance <= KNOWN_COLOR_HUE_PADDING + 4:
+        return closest_name
+
+    return None
+
+
 class AutoCalibrator:
     def __init__(self):
         self.profiles = []
         self.last_update_time = 0
+        self.last_candidate_count = 0
 
     def update(self, frame, hsv, current_time):
         if not AUTO_CALIBRATE:
@@ -198,6 +285,7 @@ class AutoCalibrator:
 
         self.last_update_time = current_time
         candidates = self.find_candidates(frame, hsv)
+        self.last_candidate_count = len(candidates)
 
         for candidate in candidates:
             self.merge_candidate(candidate, current_time)
@@ -251,9 +339,14 @@ class AutoCalibrator:
                 int(np.median(pixels[:, 1])),
                 int(np.median(pixels[:, 2]))
             ))
+            classified_name = classify_known_ball_hue(hue)
+
+            if classified_name is None:
+                continue
+
             candidates.append(
                 AutoCalibrationProfile(
-                    name="auto-" + str(hue),
+                    name=classified_name + "-auto",
                     hue=hue,
                     color_range=new_range,
                     box_color=box_color,
@@ -277,11 +370,11 @@ class AutoCalibrator:
                 )
                 profile.color_range = candidate.color_range
                 profile.box_color = candidate.box_color
+                profile.name = candidate.name
                 profile.last_seen_time = current_time
                 profile.observations = observations
                 return
 
-        candidate.name = "auto-" + str(len(self.profiles) + 1)
         candidate.last_seen_time = current_time
         self.profiles.append(candidate)
         self.profiles = sorted(
@@ -1311,6 +1404,10 @@ def make_mask(hsv, color):
     return mask
 
 
+def is_known_or_auto_color(color):
+    return color.get("known_ball_color", False) or color.get("auto_calibrated", False)
+
+
 def is_spherical(contour, width, height, mask):
     perimeter = cv2.arcLength(contour, True)
 
@@ -1395,8 +1492,10 @@ def detect_tennis_balls(frame, hsv, active_colors):
     targets = []
     detected_ball_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
     minimum_ball_area = frame.shape[0] * frame.shape[1] * MIN_BALL_AREA_RATIO
+    debug = DetectionDebug(active_colors=len(active_colors))
 
     for color in active_colors:
+        debug.masks_checked += 1
         mask = make_mask(hsv, color)
         contours, _ = cv2.findContours(
             mask,
@@ -1405,17 +1504,21 @@ def detect_tennis_balls(frame, hsv, active_colors):
         )
 
         for contour in contours:
+            debug.contours_seen += 1
             area = cv2.contourArea(contour)
 
             if area <= minimum_ball_area:
+                debug.rejected_small += 1
                 continue
 
             x, y, w, h = cv2.boundingRect(contour)
 
             if not is_spherical(contour, w, h, mask):
+                debug.rejected_shape += 1
                 continue
 
-            if not has_sampled_color_variety(contour, hsv, color):
+            if not is_known_or_auto_color(color) and not has_sampled_color_variety(contour, hsv, color):
+                debug.rejected_samples += 1
                 continue
 
             center_x = x + w // 2
@@ -1443,8 +1546,9 @@ def detect_tennis_balls(frame, hsv, active_colors):
                     color=color["box_color"]
                 )
             )
+            debug.accepted += 1
 
-    return targets, detected_ball_mask
+    return targets, detected_ball_mask, debug
 
 
 def choose_best_target(targets, frame_width):
@@ -1489,7 +1593,7 @@ def make_drive_command(best_target, frame_width, frame_area, last_seen_time, cur
     return DriveCommand(steering, throttle, "assist", reason)
 
 
-def draw_runtime_overlay(frame, targets, best_target, command, auto_color_count):
+def draw_runtime_overlay(frame, targets, best_target, command, debug):
     frame_center_x = frame.shape[1] // 2
 
     cv2.line(
@@ -1576,8 +1680,45 @@ def draw_runtime_overlay(frame, targets, best_target, command, auto_color_count)
     )
     cv2.putText(
         frame,
-        "Auto calibration colors: " + str(auto_color_count),
+        (
+            "Vision: colors="
+            + str(debug.active_colors)
+            + " contours="
+            + str(debug.contours_seen)
+            + " ok="
+            + str(debug.accepted)
+        ),
         (10, 120),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (255, 255, 255),
+        2
+    )
+    cv2.putText(
+        frame,
+        (
+            "Rejects: small="
+            + str(debug.rejected_small)
+            + " shape="
+            + str(debug.rejected_shape)
+            + " sample="
+            + str(debug.rejected_samples)
+        ),
+        (10, 150),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (255, 255, 255),
+        2
+    )
+    cv2.putText(
+        frame,
+        (
+            "Auto: candidates="
+            + str(debug.auto_candidates)
+            + " profiles="
+            + str(debug.auto_profiles)
+        ),
+        (10, 180),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.7,
         (255, 255, 255),
@@ -1585,14 +1726,34 @@ def draw_runtime_overlay(frame, targets, best_target, command, auto_color_count)
     )
 
 
-def print_telemetry(best_target, command):
+def print_telemetry(best_target, command, debug):
+    debug_text = (
+        "colors="
+        + str(debug.active_colors)
+        + " contours="
+        + str(debug.contours_seen)
+        + " ok="
+        + str(debug.accepted)
+        + " small="
+        + str(debug.rejected_small)
+        + " shape="
+        + str(debug.rejected_shape)
+        + " sample="
+        + str(debug.rejected_samples)
+        + " auto_candidates="
+        + str(debug.auto_candidates)
+        + " auto_profiles="
+        + str(debug.auto_profiles)
+    )
+
     if best_target is None:
         print(
             "Telemetry:",
             "target=none",
             "steering=" + str(round(command.steering, 3)),
             "throttle=" + str(round(command.throttle, 3)),
-            "reason=" + command.reason
+            "reason=" + command.reason,
+            debug_text
         )
         return
 
@@ -1605,7 +1766,8 @@ def print_telemetry(best_target, command):
         "confidence=" + str(round(best_target.confidence, 2)),
         "steering=" + str(round(command.steering, 3)),
         "throttle=" + str(round(command.throttle, 3)),
-        "reason=" + command.reason
+        "reason=" + command.reason,
+        debug_text
     )
 
 
@@ -1742,8 +1904,10 @@ try:
         current_time = time.time()
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         auto_colors = auto_calibrator.update(frame, hsv, current_time)
-        active_colors = auto_colors + colors
-        targets, detected_ball_mask = detect_tennis_balls(frame, hsv, active_colors)
+        active_colors = auto_colors + KNOWN_BALL_COLORS + colors
+        targets, detected_ball_mask, debug = detect_tennis_balls(frame, hsv, active_colors)
+        debug.auto_candidates = auto_calibrator.last_candidate_count
+        debug.auto_profiles = len(auto_colors)
         best_target = choose_best_target(targets, frame.shape[1])
 
         if best_target is not None:
@@ -1759,11 +1923,11 @@ try:
         actuators.apply(command)
 
         if current_time - last_detection_print_time >= TELEMETRY_INTERVAL:
-            print_telemetry(best_target, command)
+            print_telemetry(best_target, command, debug)
             last_detection_print_time = current_time
 
         if not HEADLESS:
-            draw_runtime_overlay(frame, targets, best_target, command, len(auto_colors))
+            draw_runtime_overlay(frame, targets, best_target, command, debug)
             cv2.imshow(window_name, frame)
             cv2.imshow("Detected Ball Mask", detected_ball_mask)
 
