@@ -190,6 +190,25 @@ def print_camera_read_failure(camera):
     print("  libcamera-hello --list-cameras")
     print()
 
+def print_camera_read_failure(camera):
+    print("Could not access camera")
+    print("Camera read failure debug:")
+    print("  selected backend:", type(camera).__name__)
+
+    if hasattr(camera, "isOpened"):
+        print("  opencv isOpened:", camera.isOpened())
+        print("  opencv backend:", camera.getBackendName() if camera.isOpened() else "none")
+        print("  opencv width:", camera.get(cv2.CAP_PROP_FRAME_WIDTH))
+        print("  opencv height:", camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    print("  /dev video devices:", ", ".join(list_video_devices()) or "none")
+    print()
+    print("Try these on the Pi for more context:")
+    print("  CAMERA_BACKEND=picamera2 python3 detector.py")
+    print("  python3 -c \"from picamera2 import Picamera2; print(Picamera2.global_camera_info())\"")
+    print("  libcamera-hello --list-cameras")
+    print()
+
 
 def make_range_from_hsv(hsv_value):
     hue_range = 5
@@ -906,27 +925,6 @@ colors = [
         ],
         "box_color": (224, 184, 76)
     },
-    {
-        "name": "limon",
-        "lower": np.array([39, 0, 204]),
-        "upper": np.array([84, 120, 255]),
-        "sample_ranges": [
-            {
-                "lower": np.array([75, 0, 198]),
-                "upper": np.array([85, 50, 255]),
-            },
-            {
-                "lower": np.array([48, 0, 207]),
-                "upper": np.array([58, 60, 255]),
-            },
-            {
-                "lower": np.array([38, 55, 189]),
-                "upper": np.array([48, 135, 255]),
-            },
-        ],
-        "box_color": (200, 238, 202),
-        "min_detection_saturation": 45
-    },
 ]
 
 
@@ -1164,6 +1162,7 @@ while True:
     ret, frame = camera.read()
 
     if not ret:
+        print_camera_read_failure(camera)
         print_camera_read_failure(camera)
         break
 
