@@ -49,6 +49,11 @@ AUTO_CALIBRATION_MERGE_HUE_DISTANCE = int(os.environ.get("AUTO_CALIBRATION_MERGE
 KNOWN_COLOR_HUE_PADDING = int(os.environ.get("KNOWN_COLOR_HUE_PADDING", "12"))
 KNOWN_COLOR_SATURATION_MIN = int(os.environ.get("KNOWN_COLOR_SATURATION_MIN", "45"))             
 KNOWN_COLOR_VALUE_MIN = int(os.environ.get("KNOWN_COLOR_VALUE_MIN", "60"))
+TARGET_DISTANCE_WEIGHT = float(os.environ.get("TARGET_DISTANCE_WEIGHT", "0.55"))
+TARGET_CLUSTER_WEIGHT = float(os.environ.get("TARGET_CLUSTER_WEIGHT", "0.35"))
+TARGET_AREA_WEIGHT = float(os.environ.get("TARGET_AREA_WEIGHT", "0.1"))
+TARGET_CENTER_WEIGHT = float(os.environ.get("TARGET_CENTER_WEIGHT", "0.05"))
+TARGET_CLUSTER_RADIUS_RATIO = float(os.environ.get("TARGET_CLUSTER_RADIUS_RATIO", "0.22"))
 
 
 def parse_bool(name, value):
@@ -137,6 +142,12 @@ class DetectionDebug:
     accepted: int = 0
     auto_candidates: int = 0
     auto_profiles: int = 0
+    priority_score: float = 0.0
+    priority_distance: float = 0.0
+    priority_cluster: float = 0.0
+    priority_area: float = 0.0
+    priority_center: float = 0.0
+    priority_neighbors: int = 0
 
 
 def clamp(value, minimum, maximum):
@@ -242,6 +253,12 @@ class TuiDashboard:
                 + " radius:" + str(best_target.radius),
                 "area=" + str(int(best_target.area))
                 + " confidence=" + str(round(best_target.confidence, 2)),
+                "priority score=" + str(round(debug.priority_score, 3))
+                + " distance=" + str(round(debug.priority_distance, 3))
+                + " cluster=" + str(round(debug.priority_cluster, 3)),
+                "priority area=" + str(round(debug.priority_area, 3))
+                + " center=" + str(round(debug.priority_center, 3))
+                + " neighbors=" + str(debug.priority_neighbors),
             ])
 
         lines.extend([
@@ -289,6 +306,11 @@ class TuiDashboard:
             "drive gain=" + str(STEERING_GAIN)
             + " deadband=" + str(STEERING_DEADBAND)
             + " max_throttle=" + str(MAX_TRIAL_THROTTLE),
+            "priority weights distance=" + str(TARGET_DISTANCE_WEIGHT)
+            + " cluster=" + str(TARGET_CLUSTER_WEIGHT)
+            + " area=" + str(TARGET_AREA_WEIGHT)
+            + " center=" + str(TARGET_CENTER_WEIGHT),
+            "priority cluster_radius_ratio=" + str(TARGET_CLUSTER_RADIUS_RATIO),
         ])
 
         return lines
@@ -1764,20 +1786,99 @@ def detect_tennis_balls(frame, hsv, active_colors):
     return targets, detected_ball_mask, debug
 
 
-def choose_best_target(targets, frame_width):
+def score_target_priority(target, targets, frame_width, frame_height, frame_area):
+    distance_score = clamp(target.center_y / float(frame_height), 0.0, 1.0)
+    area_score = clamp(target.area / float(frame_area * CLOSE_BALL_AREA_RATIO), 0.0, 1.0)
+    center_score = 1.0 - clamp(
+        abs(target.center_x - frame_width / 2.0) / (frame_width / 2.0),
+        0.0,
+        1.0
+    )
+    cluster_radius = max(1.0, frame_width * TARGET_CLUSTER_RADIUS_RATIO)
+    cluster_area = target.area
+    neighbor_count = 0
+
+    for other in targets:
+        if other is target:
+            continue
+
+        distance = np.hypot(
+            target.center_x - other.center_x,
+            target.center_y - other.center_y
+        )
+
+        if distance <= cluster_radius:
+            closeness = 1.0 - distance / cluster_radius
+            cluster_area += other.area * closeness
+            neighbor_count += 1
+
+    cluster_area_score = clamp(
+        cluster_area / float(frame_area * CLOSE_BALL_AREA_RATIO),
+        0.0,
+        1.0
+    )
+    cluster_count_score = clamp(neighbor_count / 3.0, 0.0, 1.0)
+    cluster_score = clamp(
+        cluster_area_score * 0.65 + cluster_count_score * 0.35,
+        0.0,
+        1.0
+    )
+    priority_score = (
+        distance_score * TARGET_DISTANCE_WEIGHT
+        + cluster_score * TARGET_CLUSTER_WEIGHT
+        + area_score * TARGET_AREA_WEIGHT
+        + center_score * TARGET_CENTER_WEIGHT
+    )
+
+    return {
+        "score": priority_score,
+        "distance": distance_score,
+        "cluster": cluster_score,
+        "area": area_score,
+        "center": center_score,
+        "neighbors": neighbor_count
+    }
+
+
+def choose_best_target(targets, frame_width, frame_height, debug=None):
     if len(targets) == 0:
         return None
 
-    frame_center_x = frame_width / 2.0
+    frame_area = frame_width * frame_height
+    scored_targets = []
 
-    return sorted(
-        targets,
-        key=lambda target: (
-            target.area,
-            -abs(target.center_x - frame_center_x)
+    for target in targets:
+        priority = score_target_priority(
+            target,
+            targets,
+            frame_width,
+            frame_height,
+            frame_area
+        )
+        scored_targets.append((priority, target))
+
+    scored_targets = sorted(
+        scored_targets,
+        key=lambda item: (
+            item[0]["score"],
+            item[0]["distance"],
+            item[0]["cluster"],
+            item[1].area,
+            -abs(item[1].center_x - frame_width / 2.0)
         ),
         reverse=True
-    )[0]
+    )
+    best_priority, best_target = scored_targets[0]
+
+    if debug is not None:
+        debug.priority_score = best_priority["score"]
+        debug.priority_distance = best_priority["distance"]
+        debug.priority_cluster = best_priority["cluster"]
+        debug.priority_area = best_priority["area"]
+        debug.priority_center = best_priority["center"]
+        debug.priority_neighbors = best_priority["neighbors"]
+
+    return best_target
 
 
 def make_drive_command(best_target, frame_width, frame_area, last_seen_time, current_time):
@@ -1965,6 +2066,14 @@ def print_telemetry(best_target, command, debug):
         + str(debug.auto_candidates)
         + " auto_profiles="
         + str(debug.auto_profiles)
+        + " priority="
+        + str(round(debug.priority_score, 3))
+        + " priority_distance="
+        + str(round(debug.priority_distance, 3))
+        + " priority_cluster="
+        + str(round(debug.priority_cluster, 3))
+        + " priority_neighbors="
+        + str(debug.priority_neighbors)
     )
 
     if best_target is None:
@@ -2137,7 +2246,7 @@ try:
         targets, detected_ball_mask, debug = detect_tennis_balls(frame, hsv, active_colors)
         debug.auto_candidates = auto_calibrator.last_candidate_count
         debug.auto_profiles = len(auto_colors)
-        best_target = choose_best_target(targets, frame.shape[1])
+        best_target = choose_best_target(targets, frame.shape[1], frame.shape[0], debug)
 
         if best_target is not None:
             last_target_seen_time = current_time
