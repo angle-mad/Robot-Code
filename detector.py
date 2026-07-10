@@ -133,6 +133,18 @@ class VisionTarget:
 
 
 @dataclass
+class ConeDetection:
+    label: str
+    center_x: int
+    center_y: int
+    area: float
+    confidence: float
+    box: tuple
+    contour: object
+    color: tuple
+
+
+@dataclass
 class DriveCommand:
     steering: float
     throttle: float
@@ -161,6 +173,12 @@ class DetectionDebug:
     rejected_samples: int = 0
     rejected_overlap: int = 0
     accepted: int = 0
+    cones: int = 0
+    cone_nearest_label: str = "none"
+    cone_nearest_x: int = 0
+    cone_nearest_y: int = 0
+    cone_nearest_area: float = 0.0
+    cone_nearest_confidence: float = 0.0
     auto_candidates: int = 0
     auto_profiles: int = 0
     priority_score: float = 0.0
@@ -385,6 +403,12 @@ class TuiDashboard:
             + " masks=" + str(debug.masks_checked)
             + " contours=" + str(debug.contours_seen)
             + " accepted=" + str(debug.accepted),
+            "cones=" + str(debug.cones)
+            + " nearest=" + debug.cone_nearest_label
+            + " x=" + str(debug.cone_nearest_x)
+            + " y=" + str(debug.cone_nearest_y)
+            + " area=" + str(int(debug.cone_nearest_area))
+            + " confidence=" + str(round(debug.cone_nearest_confidence, 2)),
             "reject_small=" + str(debug.rejected_small)
             + " reject_large=" + str(debug.rejected_large)
             + " reject_shape=" + str(debug.rejected_shape)
@@ -1749,6 +1773,65 @@ def contour_is_triangular(contour, perimeter):
     return len(approximated) <= 4 and cv2.isContourConvex(approximated)
 
 
+def mask_width_at_y(mask_roi, y_start, y_end):
+    band = mask_roi[y_start:y_end, :]
+
+    if band.size == 0:
+        return 0
+
+    columns = np.where(np.any(band > 0, axis=0))[0]
+
+    if len(columns) == 0:
+        return 0
+
+    return int(columns[-1] - columns[0] + 1)
+
+
+def contour_has_cone_taper(x, y, width, height, mask):
+    if height < 12 or width < 8:
+        return False
+
+    if height < width * 0.8:
+        return False
+
+    mask_roi = mask[y:y + height, x:x + width]
+    top_width = mask_width_at_y(
+        mask_roi,
+        int(height * 0.10),
+        max(int(height * 0.30), int(height * 0.10) + 1)
+    )
+    middle_width = mask_width_at_y(
+        mask_roi,
+        int(height * 0.42),
+        max(int(height * 0.58), int(height * 0.42) + 1)
+    )
+    bottom_width = mask_width_at_y(
+        mask_roi,
+        int(height * 0.70),
+        max(int(height * 0.92), int(height * 0.70) + 1)
+    )
+
+    if top_width == 0 or middle_width == 0 or bottom_width == 0:
+        return False
+
+    return (
+        bottom_width >= top_width * 1.35
+        and bottom_width >= middle_width * 1.12
+    )
+
+
+def contour_is_cone_like(contour, x, y, width, height, mask):
+    perimeter = cv2.arcLength(contour, True)
+
+    if perimeter == 0:
+        return False
+
+    return (
+        contour_is_triangular(contour, perimeter)
+        or contour_has_cone_taper(x, y, width, height, mask)
+    )
+
+
 def is_spherical(contour, width, height, mask):
     perimeter = cv2.arcLength(contour, True)
 
@@ -1889,6 +1972,7 @@ def minimum_ball_area_for_y(center_y, frame_height, frame_area):
 
 def detect_tennis_balls(frame, hsv, active_colors):
     targets = []
+    cones = []
     detected_ball_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
     frame_area = frame.shape[0] * frame.shape[1]
     maximum_ball_area = frame_area * MAX_BALL_AREA_RATIO
@@ -1920,6 +2004,21 @@ def detect_tennis_balls(frame, hsv, active_colors):
 
             if area >= maximum_ball_area:
                 debug.rejected_large += 1
+                continue
+
+            if contour_is_cone_like(contour, x, y, w, h, mask):
+                cones.append(
+                    ConeDetection(
+                        label=color["name"] + "-cone",
+                        center_x=x + w // 2,
+                        center_y=center_y,
+                        area=area,
+                        confidence=clamp(area / float(frame_area * 0.12), 0.0, 1.0),
+                        box=(x, y, w, h),
+                        contour=contour,
+                        color=(255, 0, 255)
+                    )
+                )
                 continue
 
             if not is_spherical(contour, w, h, mask):
@@ -1960,8 +2059,23 @@ def detect_tennis_balls(frame, hsv, active_colors):
     targets = cull_overlapping_targets(targets)
     debug.rejected_overlap = raw_target_count - len(targets)
     debug.accepted = len(targets)
+    debug.cones = len(cones)
 
-    return targets, detected_ball_mask, debug
+    if len(cones) > 0:
+        nearest_cone = max(
+            cones,
+            key=lambda cone: (
+                cone.center_y,
+                cone.area
+            )
+        )
+        debug.cone_nearest_label = nearest_cone.label
+        debug.cone_nearest_x = nearest_cone.center_x
+        debug.cone_nearest_y = nearest_cone.center_y
+        debug.cone_nearest_area = nearest_cone.area
+        debug.cone_nearest_confidence = nearest_cone.confidence
+
+    return targets, cones, detected_ball_mask, debug
 
 
 def score_target_priority(target, targets, frame_width, frame_height, frame_area):
@@ -2305,7 +2419,43 @@ def make_drive_command(best_target, frame_width, frame_area, last_seen_time, cur
     return DriveCommand(steering, throttle, "assist", reason)
 
 
-def draw_runtime_overlay(frame, targets, best_target, command, debug):
+def draw_corner_box(frame, box, color, thickness):
+    x, y, width, height = box
+    corner = max(8, min(width, height) // 3)
+
+    cv2.line(frame, (x, y), (x + corner, y), color, thickness)
+    cv2.line(frame, (x, y), (x, y + corner), color, thickness)
+    cv2.line(frame, (x + width, y), (x + width - corner, y), color, thickness)
+    cv2.line(frame, (x + width, y), (x + width, y + corner), color, thickness)
+    cv2.line(frame, (x, y + height), (x + corner, y + height), color, thickness)
+    cv2.line(frame, (x, y + height), (x, y + height - corner), color, thickness)
+    cv2.line(frame, (x + width, y + height), (x + width - corner, y + height), color, thickness)
+    cv2.line(frame, (x + width, y + height), (x + width, y + height - corner), color, thickness)
+
+
+def draw_cone_marker(frame, cone):
+    x, y, width, height = cone.box
+    color = cone.color
+    triangle = np.array([
+        [cone.center_x, y],
+        [x, y + height],
+        [x + width, y + height],
+    ], dtype=np.int32)
+
+    cv2.drawContours(frame, [cone.contour], -1, color, 2)
+    draw_corner_box(frame, cone.box, color, 2)
+    cv2.polylines(frame, [triangle], True, color, 2)
+    cv2.drawMarker(
+        frame,
+        (cone.center_x, cone.center_y),
+        color,
+        markerType=cv2.MARKER_TILTED_CROSS,
+        markerSize=12,
+        thickness=2
+    )
+
+
+def draw_runtime_overlay(frame, targets, cones, best_target, command, debug):
     frame_center_x = frame.shape[1] // 2
 
     cv2.line(
@@ -2335,6 +2485,9 @@ def draw_runtime_overlay(frame, targets, best_target, command, debug):
             -1
         )
 
+    for cone in cones:
+        draw_cone_marker(frame, cone)
+
 
 def print_telemetry(best_target, command, debug):
     debug_text = (
@@ -2344,6 +2497,8 @@ def print_telemetry(best_target, command, debug):
         + str(debug.contours_seen)
         + " ok="
         + str(debug.accepted)
+        + " cones="
+        + str(debug.cones)
         + " small="
         + str(debug.rejected_small)
         + " large="
@@ -2553,7 +2708,7 @@ try:
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         auto_colors = auto_calibrator.update(frame, hsv, current_time)
         active_colors = auto_colors + KNOWN_BALL_COLORS + colors
-        targets, detected_ball_mask, debug = detect_tennis_balls(frame, hsv, active_colors)
+        targets, cones, detected_ball_mask, debug = detect_tennis_balls(frame, hsv, active_colors)
         debug.auto_candidates = auto_calibrator.last_candidate_count
         debug.auto_profiles = len(auto_colors)
         best_target = target_stabilizer.select_target(
@@ -2592,7 +2747,7 @@ try:
             last_detection_print_time = current_time
 
         if not HEADLESS:
-            draw_runtime_overlay(frame, targets, best_target, command, debug)
+            draw_runtime_overlay(frame, targets, cones, best_target, command, debug)
             cv2.imshow(window_name, frame)
 
             # Keeps OpenCV windows responsive; runtime key input is ignored.
