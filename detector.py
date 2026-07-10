@@ -49,6 +49,11 @@ MAX_BALL_AREA_RATIO = float(os.environ.get("MAX_BALL_AREA_RATIO", "0.15"))
 MIN_BALL_CIRCULARITY = float(os.environ.get("MIN_BALL_CIRCULARITY", "0.48"))
 MIN_BALL_CIRCLE_FILL = float(os.environ.get("MIN_BALL_CIRCLE_FILL", "0.50"))
 TRIANGLE_APPROX_EPSILON = float(os.environ.get("TRIANGLE_APPROX_EPSILON", "0.04"))
+CONE_HUE_MIN = int(os.environ.get("CONE_HUE_MIN", "3"))
+CONE_HUE_MAX = int(os.environ.get("CONE_HUE_MAX", "22"))
+CONE_SATURATION_MIN = int(os.environ.get("CONE_SATURATION_MIN", "120"))
+CONE_VALUE_MIN = int(os.environ.get("CONE_VALUE_MIN", "80"))
+CONE_VALUE_MAX = int(os.environ.get("CONE_VALUE_MAX", "245"))
 AUTO_CALIBRATE_REQUEST = os.environ.get("AUTO_CALIBRATE", "true").lower()
 AUTO_CALIBRATION_INTERVAL = float(os.environ.get("AUTO_CALIBRATION_INTERVAL", "1.0"))
 AUTO_CALIBRATION_MAX_COLORS = int(os.environ.get("AUTO_CALIBRATION_MAX_COLORS", "8"))
@@ -439,6 +444,11 @@ class TuiDashboard:
             "shape circularity_min=" + str(MIN_BALL_CIRCULARITY)
             + " circle_fill_min=" + str(MIN_BALL_CIRCLE_FILL)
             + " triangle_epsilon=" + str(TRIANGLE_APPROX_EPSILON),
+            "cone hsv hue=" + str(CONE_HUE_MIN)
+            + "-" + str(CONE_HUE_MAX)
+            + " sat_min=" + str(CONE_SATURATION_MIN)
+            + " value=" + str(CONE_VALUE_MIN)
+            + "-" + str(CONE_VALUE_MAX),
             "known_color hue_padding=" + str(KNOWN_COLOR_HUE_PADDING)
             + " sat_min=" + str(KNOWN_COLOR_SATURATION_MIN)
             + " value_min=" + str(KNOWN_COLOR_VALUE_MIN),
@@ -1766,6 +1776,36 @@ def is_known_or_auto_color(color):
     return color.get("known_ball_color", False) or color.get("auto_calibrated", False)
 
 
+def hue_in_range(hue, minimum, maximum):
+    minimum = int(minimum) % 180
+    maximum = int(maximum) % 180
+
+    if minimum <= maximum:
+        return minimum <= hue <= maximum
+
+    return hue >= minimum or hue <= maximum
+
+
+def contour_is_deep_orange(contour, hsv):
+    contour_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+    cv2.drawContours(contour_mask, [contour], -1, 255, -1)
+    pixels = hsv[contour_mask == 255]
+
+    if len(pixels) < 30:
+        return False
+
+    hue = int(np.median(pixels[:, 0]))
+    saturation = int(np.median(pixels[:, 1]))
+    value = int(np.median(pixels[:, 2]))
+
+    return (
+        hue_in_range(hue, CONE_HUE_MIN, CONE_HUE_MAX)
+        and saturation >= CONE_SATURATION_MIN
+        and value >= CONE_VALUE_MIN
+        and value <= CONE_VALUE_MAX
+    )
+
+
 def contour_is_triangular(contour, perimeter):
     epsilon = max(0.001, TRIANGLE_APPROX_EPSILON) * perimeter
     approximated = cv2.approxPolyDP(contour, epsilon, True)
@@ -2006,7 +2046,7 @@ def detect_tennis_balls(frame, hsv, active_colors):
                 debug.rejected_large += 1
                 continue
 
-            if contour_is_cone_like(contour, x, y, w, h, mask):
+            if contour_is_deep_orange(contour, hsv) and contour_is_cone_like(contour, x, y, w, h, mask):
                 cones.append(
                     ConeDetection(
                         label=color["name"] + "-cone",
