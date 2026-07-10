@@ -14,7 +14,7 @@ FRAME_HEIGHT = 480
 CAMERA_BACKEND = os.environ.get("CAMERA_BACKEND", "auto").lower()
 VALID_CAMERA_BACKENDS = ("auto", "picamera2", "opencv")
 PICAMERA2_SWAP_RED_BLUE = os.environ.get("PICAMERA2_SWAP_RED_BLUE", "true").lower()
-ENABLE_ACTUATORS_REQUEST = os.environ.get("ENABLE_ACTUATORS", "true").lower()
+ENABLE_ACTUATORS_REQUEST = os.environ.get("ENABLE_ACTUATORS", "false").lower()
 VALID_BOOLEAN_OPTIONS = ("true", "false")
 HEADLESS_REQUEST = os.environ.get("HEADLESS", "auto").lower()
 VALID_HEADLESS_OPTIONS = ("auto", "true", "false")
@@ -44,6 +44,7 @@ TELEMETRY_INTERVAL = float(os.environ.get("TELEMETRY_INTERVAL", "0.25"))
 TUI_REQUEST = os.environ.get("TUI", "true").lower()
 TUI_INTERVAL = float(os.environ.get("TUI_INTERVAL", "0.1"))
 MIN_BALL_AREA_RATIO = float(os.environ.get("MIN_BALL_AREA_RATIO", "0.004"))
+MIN_BALL_AREA_TOP_SCALE = float(os.environ.get("MIN_BALL_AREA_TOP_SCALE", "0.25"))
 MAX_BALL_AREA_RATIO = float(os.environ.get("MAX_BALL_AREA_RATIO", "0.15"))
 AUTO_CALIBRATE_REQUEST = os.environ.get("AUTO_CALIBRATE", "true").lower()
 AUTO_CALIBRATION_INTERVAL = float(os.environ.get("AUTO_CALIBRATION_INTERVAL", "1.0"))
@@ -56,12 +57,12 @@ AUTO_CALIBRATION_SATURATION_PADDING = int(os.environ.get("AUTO_CALIBRATION_SATUR
 AUTO_CALIBRATION_VALUE_PADDING = int(os.environ.get("AUTO_CALIBRATION_VALUE_PADDING", "45"))
 AUTO_CALIBRATION_MERGE_HUE_DISTANCE = int(os.environ.get("AUTO_CALIBRATION_MERGE_HUE_DISTANCE", "10"))
 KNOWN_COLOR_HUE_PADDING = int(os.environ.get("KNOWN_COLOR_HUE_PADDING", "12"))
-KNOWN_COLOR_SATURATION_MIN = int(os.environ.get("KNOWN_COLOR_SATURATION_MIN", "45"))             
+KNOWN_COLOR_SATURATION_MIN = int(os.environ.get("KNOWN_COLOR_SATURATION_MIN", "45"))
 KNOWN_COLOR_VALUE_MIN = int(os.environ.get("KNOWN_COLOR_VALUE_MIN", "60"))
-TARGET_DISTANCE_WEIGHT = float(os.environ.get("TARGET_DISTANCE_WEIGHT", "0.55"))
-TARGET_CLUSTER_WEIGHT = float(os.environ.get("TARGET_CLUSTER_WEIGHT", "0.35"))
-TARGET_AREA_WEIGHT = float(os.environ.get("TARGET_AREA_WEIGHT", "0.1"))
-TARGET_CENTER_WEIGHT = float(os.environ.get("TARGET_CENTER_WEIGHT", "0.05"))
+TARGET_DISTANCE_WEIGHT = float(os.environ.get("TARGET_DISTANCE_WEIGHT", "0.75"))
+TARGET_CLUSTER_WEIGHT = float(os.environ.get("TARGET_CLUSTER_WEIGHT", "0.25"))
+TARGET_AREA_WEIGHT = float(os.environ.get("TARGET_AREA_WEIGHT", "0.08"))
+TARGET_CENTER_WEIGHT = float(os.environ.get("TARGET_CENTER_WEIGHT", "0.03"))
 TARGET_CLUSTER_RADIUS_RATIO = float(os.environ.get("TARGET_CLUSTER_RADIUS_RATIO", "0.22"))
 TARGET_LOCK_RADIUS_RATIO = float(os.environ.get("TARGET_LOCK_RADIUS_RATIO", "0.18"))
 TARGET_SWITCH_MARGIN = float(os.environ.get("TARGET_SWITCH_MARGIN", "0.18"))
@@ -405,6 +406,7 @@ class TuiDashboard:
             "",
             "[Tuning]",
             "ball_area_ratio min=" + str(MIN_BALL_AREA_RATIO)
+            + " top_scale=" + str(MIN_BALL_AREA_TOP_SCALE)
             + " max=" + str(MAX_BALL_AREA_RATIO)
             + " close=" + str(CLOSE_BALL_AREA_RATIO),
             "known_color hue_padding=" + str(KNOWN_COLOR_HUE_PADDING)
@@ -1859,11 +1861,18 @@ def cull_overlapping_targets(targets):
     return kept_targets
 
 
+def minimum_ball_area_for_y(center_y, frame_height, frame_area):
+    y_ratio = clamp(center_y / float(max(1, frame_height)), 0.0, 1.0)
+    top_scale = clamp(MIN_BALL_AREA_TOP_SCALE, 0.0, 1.0)
+    area_ratio = MIN_BALL_AREA_RATIO * (top_scale + (1.0 - top_scale) * y_ratio)
+    return frame_area * area_ratio
+
+
 def detect_tennis_balls(frame, hsv, active_colors):
     targets = []
     detected_ball_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
-    minimum_ball_area = frame.shape[0] * frame.shape[1] * MIN_BALL_AREA_RATIO
-    maximum_ball_area = frame.shape[0] * frame.shape[1] * MAX_BALL_AREA_RATIO
+    frame_area = frame.shape[0] * frame.shape[1]
+    maximum_ball_area = frame_area * MAX_BALL_AREA_RATIO
     debug = DetectionDebug(active_colors=len(active_colors))
 
     for color in active_colors:
@@ -1878,6 +1887,13 @@ def detect_tennis_balls(frame, hsv, active_colors):
         for contour in contours:
             debug.contours_seen += 1
             area = cv2.contourArea(contour)
+            x, y, w, h = cv2.boundingRect(contour)
+            center_y = y + h // 2
+            minimum_ball_area = minimum_ball_area_for_y(
+                center_y,
+                frame.shape[0],
+                frame_area
+            )
 
             if area <= minimum_ball_area:
                 debug.rejected_small += 1
@@ -1886,8 +1902,6 @@ def detect_tennis_balls(frame, hsv, active_colors):
             if area >= maximum_ball_area:
                 debug.rejected_large += 1
                 continue
-
-            x, y, w, h = cv2.boundingRect(contour)
 
             if not is_spherical(contour, w, h, mask):
                 debug.rejected_shape += 1
@@ -1898,9 +1912,8 @@ def detect_tennis_balls(frame, hsv, active_colors):
                 continue
 
             center_x = x + w // 2
-            center_y = y + h // 2
             radius = int(max(w, h) / 2)
-            confidence = clamp(area / float(frame.shape[0] * frame.shape[1] * 0.12), 0.0, 1.0)
+            confidence = clamp(area / float(frame_area * 0.12), 0.0, 1.0)
 
             cv2.circle(
                 detected_ball_mask,
