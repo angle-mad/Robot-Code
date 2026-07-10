@@ -46,6 +46,9 @@ TUI_INTERVAL = float(os.environ.get("TUI_INTERVAL", "0.1"))
 MIN_BALL_AREA_RATIO = float(os.environ.get("MIN_BALL_AREA_RATIO", "0.004"))
 MIN_BALL_AREA_TOP_SCALE = float(os.environ.get("MIN_BALL_AREA_TOP_SCALE", "0.25"))
 MAX_BALL_AREA_RATIO = float(os.environ.get("MAX_BALL_AREA_RATIO", "0.15"))
+MIN_BALL_CIRCULARITY = float(os.environ.get("MIN_BALL_CIRCULARITY", "0.48"))
+MIN_BALL_CIRCLE_FILL = float(os.environ.get("MIN_BALL_CIRCLE_FILL", "0.50"))
+TRIANGLE_APPROX_EPSILON = float(os.environ.get("TRIANGLE_APPROX_EPSILON", "0.04"))
 AUTO_CALIBRATE_REQUEST = os.environ.get("AUTO_CALIBRATE", "true").lower()
 AUTO_CALIBRATION_INTERVAL = float(os.environ.get("AUTO_CALIBRATION_INTERVAL", "1.0"))
 AUTO_CALIBRATION_MAX_COLORS = int(os.environ.get("AUTO_CALIBRATION_MAX_COLORS", "8"))
@@ -409,6 +412,9 @@ class TuiDashboard:
             + " top_scale=" + str(MIN_BALL_AREA_TOP_SCALE)
             + " max=" + str(MAX_BALL_AREA_RATIO)
             + " close=" + str(CLOSE_BALL_AREA_RATIO),
+            "shape circularity_min=" + str(MIN_BALL_CIRCULARITY)
+            + " circle_fill_min=" + str(MIN_BALL_CIRCLE_FILL)
+            + " triangle_epsilon=" + str(TRIANGLE_APPROX_EPSILON),
             "known_color hue_padding=" + str(KNOWN_COLOR_HUE_PADDING)
             + " sat_min=" + str(KNOWN_COLOR_SATURATION_MIN)
             + " value_min=" + str(KNOWN_COLOR_VALUE_MIN),
@@ -1736,10 +1742,20 @@ def is_known_or_auto_color(color):
     return color.get("known_ball_color", False) or color.get("auto_calibrated", False)
 
 
+def contour_is_triangular(contour, perimeter):
+    epsilon = max(0.001, TRIANGLE_APPROX_EPSILON) * perimeter
+    approximated = cv2.approxPolyDP(contour, epsilon, True)
+
+    return len(approximated) <= 4 and cv2.isContourConvex(approximated)
+
+
 def is_spherical(contour, width, height, mask):
     perimeter = cv2.arcLength(contour, True)
 
     if perimeter == 0:
+        return False
+
+    if contour_is_triangular(contour, perimeter):
         return False
 
     area = cv2.contourArea(contour)
@@ -1777,7 +1793,10 @@ def is_spherical(contour, width, height, mask):
     if width_height_ratio < 0.6 or width_height_ratio > 1.4:
         return False
 
-    if circularity < 0.35 and circle_fill_ratio < 0.45:
+    if circularity < MIN_BALL_CIRCULARITY:
+        return False
+
+    if circle_fill_ratio < MIN_BALL_CIRCLE_FILL:
         return False
 
     if color_fill_ratio < 0.45:
